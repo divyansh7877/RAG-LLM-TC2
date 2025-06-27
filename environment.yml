@@ -1,0 +1,25 @@
+# This file is for creating a Conda environment.
+# To create the environment, run:
+# conda env create -f environment.yml
+#
+# To activate the environment, run:
+# conda activate llama_index_env
+
+name: expert-rag
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12 # Specify a Python version
+  - pytorch::pytorch # Install PyTorch from the pytorch channel
+  - pip
+  - pip:
+    - lancedb
+    - gradio
+    - llama-index
+    - llama-index-embeddings-huggingface
+    - llama-index-vector-stores-lancedb
+    - llama-index-llms-llama-cpp
+    - sentence-transformers
+    - PyMuPDF

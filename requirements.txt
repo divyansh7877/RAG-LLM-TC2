@@ -1,0 +1,9 @@
+lancedb
+gradio
+llama-index
+llama-index-embeddings-huggingface
+llama-index-vector-stores-lancedb
+llama-index-llms-llama-cpp
+sentence-transformers
+torch
+PyMuPDF
