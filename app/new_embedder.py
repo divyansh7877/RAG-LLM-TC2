@@ -55,6 +55,8 @@ def clean_text(raw_text: str) -> str:
 
 def nodes_from_single_pdf(
     pdf_path: str,
+    user_id: str,
+    group_id: str,
     chunk_size: int = 512,
     chunk_overlap: int = 20,
 ):
@@ -68,6 +70,8 @@ def nodes_from_single_pdf(
         metadata = {
             "document_name": document_name,
             "page_number": page_number,
+            "user_id": user_id,
+            "group_id": group_id,
         }
         documents.append(
             Document(
@@ -87,13 +91,23 @@ def nodes_from_single_pdf(
 
 def build_nodes_from_pdfs(
     pdf_paths: List[str],
+    user_id: str,
+    group_id: str,
     chunk_size: int = 512,
     chunk_overlap: int = 20,
 ):
     """Aggregate nodes from a list of PDFs."""
     nodes = []
     for path in pdf_paths:
-        nodes.extend(nodes_from_single_pdf(path, chunk_size, chunk_overlap))
+        nodes.extend(
+            nodes_from_single_pdf(
+                path,
+                user_id=user_id,
+                group_id=group_id,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+        )
     return nodes
 
 # ────────────────────────── Ingestion & storage ────────────────────
@@ -138,15 +152,18 @@ def embed_and_store(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="One‑time PDF → LanceDB ingestion with semantic chunking.",
+        description="Embeds PDF documents into a LanceDB table with user/group metadata.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("pdfs", nargs="+", help="PDF files or glob patterns")
-    parser.add_argument("--db", default="./lancedb_expert_calls", help="LanceDB dir")
-    parser.add_argument("--device", default="cpu", help="Embedding device cpu/gpu")
-    parser.add_argument("--chunk_size", type=int, default=512)
-    parser.add_argument("--chunk_overlap", type=int, default=20)
-    parser.add_argument("--model_dir", default="./gte-large-en-v1.5",
-                    help="Local SBERT checkpoint directory")
+    parser.add_argument("pdfs", nargs="+", help="Path(s) or glob pattern(s) for PDF files.")
+    parser.add_argument("--db", default="./multi_user_db.lance", help="Path to the LanceDB database directory.")
+    parser.add_argument("--table", default="document_embeddings", help="Name of the table to create or use.")
+    parser.add_argument("--user_id", required=True, help="The user ID to associate with these documents.")
+    parser.add_argument("--group_id", required=True, help="The group ID to associate with these documents (e.g., 'personal', 'assistance').")
+    parser.add_argument("--model_dir", default="./models/gte-large-en-v1.5", help="Path to the local HuggingFace embedding model.")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device to use for embedding ('cpu' or 'cuda').")
+    parser.add_argument("--chunk_size", type=int, default=512, help="Size of text chunks for splitting.")
+    parser.add_argument("--chunk_overlap", type=int, default=20, help="Overlap between text chunks.")
     args = parser.parse_args()
 
     # Expand potential globs (e.g. ./pdfs/*.pdf)
@@ -155,15 +172,25 @@ def main():
         pdf_paths.extend(glob.glob(pattern))
     pdf_paths = sorted(set(pdf_paths))
     if not pdf_paths:
-        raise SystemExit("No PDF files matched the given pattern(s).")
+        raise SystemExit(f"No PDF files matched the given pattern(s): {args.pdfs}")
 
-    print(f"🔍 Found {len(pdf_paths)} PDFs. Generating nodes …")
+    print(f"🔍 Found {len(pdf_paths)} PDFs. Generating nodes for user '{args.user_id}' in group '{args.group_id}'…")
     nodes = build_nodes_from_pdfs(
-        pdf_paths, chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap
+        pdf_paths,
+        user_id=args.user_id,
+        group_id=args.group_id,
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap
     )
     print(f"🧩 Created {len(nodes)} nodes. Starting embedding → LanceDB …")
 
-    embed_and_store(nodes, db_path=args.db, device=args.device,embed_model_name=args.model_dir)
+    embed_and_store(
+        nodes,
+        db_path=args.db,
+        table_name=args.table,
+        device=args.device,
+        embed_model_name=args.model_dir
+    )
 
 
 if __name__ == "__main__":

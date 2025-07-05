@@ -24,6 +24,7 @@ from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.core.vector_stores import VectorStoreInfo, MetadataFilters, ExactMatchFilter
 from sentence_transformers import SentenceTransformer
 from llama_cpp import Llama
 from sentence_transformers import SentenceTransformer
@@ -32,11 +33,11 @@ import torch
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DB_PATH = "./lancedb_expert_calls"
-TABLE_NAME = "expert_call_embeddings"
+DB_PATH = "./multi_user_db.lance"
+TABLE_NAME = "document_embeddings"
 EMBED_MODEL_NAME = "./models/gte-large-en-v1.5"  # INT8‐quantised, CPU
-GGUF_MODEL_PATH = "./models/models--lmutimb--Meta-Llama-3.1-8B-Instruct-Q5_0-GGUF/snapshots/0bec7ad9d7a9cfbd8a6d2100f10e114bec3e44ad/meta-llama-3.1-8b-instruct-q5_0.gguf"
-#GGUF_MODEL_PATH = "./models/Llama-3.2-3B-Instruct-IQ3_M.gguf"  # llama.cpp model\
+#GGUF_MODEL_PATH = "./models/models--lmutimb--Meta-Llama-3.1-8B-Instruct-Q5_0-GGUF/snapshots/0bec7ad9d7a9cfbd8a6d2100f10e114bec3e44ad/meta-llama-3.1-8b-instruct-q5_0.gguf"
+GGUF_MODEL_PATH = "./models/Llama-3.2-3B-Instruct-IQ3_M.gguf"  # llama.cpp model\
 
 has_cuda = torch.cuda.is_available()
 
@@ -143,15 +144,27 @@ query_engine = build_query_engine()
 # Gradio UI
 # ---------------------------------------------------------------------------
 
-def process_query(query_text: str):
+def process_query(query_text: str, user_id: str, group_ids: list):
     """Gradio wrapper – yields intermediate & final responses."""
     if not query_text:
-        yield "Please enter a question.", ""
-        return
+        return "Please enter a question.", ""
 
-    yield "Thinking …", ""
+    yield "Thinking...", ""
+
+    # Define metadata filters to retrieve only documents accessible by the user
+    user_filter = ExactMatchFilter(key="user_id", value=user_id)
+    group_filter = ExactMatchFilter(key="group_id", value=group_ids)
+    
+    filters = MetadataFilters(filters=[user_filter, group_filter], condition="or")
+
+    # Temporarily update the retriever's configuration for this query
+    original_filters = query_engine.retriever.vector_store_kwargs
+    query_engine.retriever.vector_store_kwargs = {"filters": filters}
 
     response = query_engine.query(query_text)
+
+    # Restore original retriever configuration
+    query_engine.retriever.vector_store_kwargs = original_filters
 
     # Build a neat citation list
     sources_md = ""
