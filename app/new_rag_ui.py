@@ -10,6 +10,8 @@ import os
 import multiprocessing as mp
 import lancedb
 import gradio as gr
+import threading
+from typing import Dict, Any
 
 from llama_index.core import (
     StorageContext,
@@ -48,7 +50,7 @@ FINAL_K = 8     # chunks passed to the LLM
 MMR_LAMBDA = 0.1
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 N_THREADS = mp.cpu_count()
-N_GPU_LAYERS = -1 if has_cuda else 0 # set 0 if no GPU / VRAM < 12 GB
+N_GPU_LAYERS = -1 if has_cuda else 0 # set 0 if no GPU / VRAM < 12 GB
 N_BATCH = 1024 if has_cuda else 64   # llama.cpp prompt batch size
 PROMPT_CACHE_DIR = "./prompt_cache"
 
@@ -66,79 +68,117 @@ QA_TEMPLATE = (
 )
 
 # ---------------------------------------------------------------------------
-# Build the Retrieval‑Augmented QA engine
+# Thread-safe Query Engine Factory
 # ---------------------------------------------------------------------------
 
-def build_query_engine():
-    """Initialise embeddings, vector store, retriever, reranker, and LLM."""
-
-    # 1⃣  Embedding model
-    Settings.embed_model = HuggingFaceEmbedding(
-        model_name=EMBED_MODEL_NAME,
-        device=device,
-        trust_remote_code=True,
-        model_kwargs={"quantize": "static-int8"},  # requires sentence-transformers >=3.3
-    )
-
-
-    # 2⃣  Llama‑3.1‑8B in llama.cpp with performance flags
-    llm = LlamaCPP(
-        #model_url = '', # for online models.
-        model_path=GGUF_MODEL_PATH,
-        temperature=0.3,
-        max_new_tokens=512,
-        context_window=2048,
-        model_kwargs={
-            #"n_threads": N_THREADS,
-            "n_batch": N_BATCH,
-            "n_gpu_layers": N_GPU_LAYERS,
-            #"prompt_cache_path": PROMPT_CACHE_DIR,
-            #"echo_prompt":True
-            #"top_p":0.9,
-        },
-        verbose=True,
+class QueryEngineFactory:
+    """Thread-safe factory for creating query engines with proper isolation."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._embed_model = None
+        self._llm = None
+        self._vector_store = None
+        self._index = None
+    
+    def _get_embed_model(self):
+        """Get or create the embedding model (singleton per process)."""
+        if self._embed_model is None:
+            with self._lock:
+                if self._embed_model is None:
+                    self._embed_model = HuggingFaceEmbedding(
+                        model_name=EMBED_MODEL_NAME,
+                        device=device,
+                        trust_remote_code=True,
+                        model_kwargs={"quantize": "static-int8"},
+                    )
+        return self._embed_model
+    
+    def _get_llm(self):
+        """Get or create the LLM (singleton per process)."""
+        if self._llm is None:
+            with self._lock:
+                if self._llm is None:
+                    self._llm = LlamaCPP(
+                        model_path=GGUF_MODEL_PATH,
+                        temperature=0.3,
+                        max_new_tokens=512,
+                        context_window=2048,
+                        model_kwargs={
+                            "n_batch": N_BATCH,
+                            "n_gpu_layers": N_GPU_LAYERS,
+                        },
+                        verbose=True,
+                    )
+        return self._llm
+    
+    def _get_vector_store(self):
+        """Get or create the vector store (singleton per process)."""
+        if self._vector_store is None:
+            with self._lock:
+                if self._vector_store is None:
+                    self._vector_store = LanceDBVectorStore(
+                        uri=DB_PATH, 
+                        table_name=TABLE_NAME, 
+                        mode="r"
+                    )
+        return self._vector_store
+    
+    def _get_index(self):
+        """Get or create the index (singleton per process)."""
+        if self._index is None:
+            with self._lock:
+                if self._index is None:
+                    vector_store = self._get_vector_store()
+                    storage_context = StorageContext.from_defaults(
+                        persist_dir=os.path.join(DB_PATH, "li_storage"),
+                        vector_store=vector_store,
+                    )
+                    self._index = load_index_from_storage(
+                        storage_context, 
+                        embed_model=self._get_embed_model()
+                    )
+        return self._index
+    
+    def create_query_engine(self, user_filters: MetadataFilters = None):
+        """Create a new query engine instance with optional user filters."""
+        # Get the shared components
+        embed_model = self._get_embed_model()
+        llm = self._get_llm()
+        index = self._get_index()
         
-    )
+        # Create a new retriever instance (not shared)
+        retriever = VectorIndexRetriever(
+            index=index,
+            similarity_top_k=BEAM_K,
+            search_type="similarity",
+        )
+        
+        # Apply user filters if provided
+        if user_filters:
+            retriever.vector_store_kwargs = {"filters": user_filters}
+        
+        # Create reranker
+        reranker = SentenceTransformerRerank(
+            model="cross-encoder/ms-marco-MiniLM-L-6-v2", 
+            top_n=FINAL_K,
+            device=device, 
+        )
+        
+        # Create response synthesizer
+        response_synthesizer = get_response_synthesizer(
+            llm=llm,
+            text_qa_template=PromptTemplate(QA_TEMPLATE),
+        )
+        
+        return RetrieverQueryEngine(
+            retriever=retriever,
+            node_postprocessors=[reranker],
+            response_synthesizer=response_synthesizer,
+        )
 
-    Settings.llm = llm
-
-    # 3⃣  Vector store – open read‑only;
-    vector_store = LanceDBVectorStore(uri=DB_PATH, table_name=TABLE_NAME, mode="r")
-    storage_context = StorageContext.from_defaults(
-        persist_dir=os.path.join(DB_PATH, "li_storage"),
-        vector_store=vector_store,
-    )
-    index = load_index_from_storage(storage_context, embed_model=Settings.embed_model)
-
-    # 4⃣  Retriever – large beam + MMR diversity
-    retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=BEAM_K,
-        search_type="similarity",          # built‑in MMR search
-        #search_kwargs={"lambda_mult": MMR_LAMBDA},
-    )
-
-    reranker = SentenceTransformerRerank(
-        model="cross-encoder/ms-marco-MiniLM-L-6-v2", 
-        top_n=FINAL_K,
-        device=device, 
-    )
-
-
-    # 6⃣  Response synthesiser with custom citation prompt
-    response_synthesizer = get_response_synthesizer(
-        llm=Settings.llm,
-        text_qa_template=PromptTemplate(QA_TEMPLATE),
-    )
-
-    return RetrieverQueryEngine(
-        retriever=retriever,
-        node_postprocessors=[reranker],  # Stage C
-        response_synthesizer=response_synthesizer,
-    )
-
-# Build the engine once at startup
-query_engine = build_query_engine()
+# Global factory instance
+query_engine_factory = QueryEngineFactory()
 
 # ---------------------------------------------------------------------------
 # Gradio UI
@@ -151,20 +191,18 @@ def process_query(query_text: str, user_id: str, group_ids: list):
 
     yield "Thinking...", ""
 
-    # Define metadata filters to retrieve only documents accessible by the user
+    # Create user-specific filters
     user_filter = ExactMatchFilter(key="user_id", value=user_id)
-    group_filter = ExactMatchFilter(key="group_id", value=group_ids)
+    group_filters = [ExactMatchFilter(key="group_id", value=group_id) for group_id in group_ids]
     
-    filters = MetadataFilters(filters=[user_filter, group_filter], condition="or")
+    # Combine filters: user can access their personal docs OR docs from their groups
+    all_filters = [user_filter] + group_filters
+    filters = MetadataFilters(filters=all_filters, condition="or")
 
-    # Temporarily update the retriever's configuration for this query
-    original_filters = query_engine.retriever.vector_store_kwargs
-    query_engine.retriever.vector_store_kwargs = {"filters": filters}
+    # Create a new query engine instance with user-specific filters
+    query_engine = query_engine_factory.create_query_engine(user_filters=filters)
 
     response = query_engine.query(query_text)
-
-    # Restore original retriever configuration
-    query_engine.retriever.vector_store_kwargs = original_filters
 
     # Build a neat citation list
     sources_md = ""
