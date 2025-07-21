@@ -7,3 +7,14 @@ llama-index-llms-llama-cpp
 sentence-transformers
 torch
 PyMuPDF
+# New dependencies for concurrent RAG optimization
+fastapi
+uvicorn[standard]
+celery[redis]
+redis
+websockets
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+pydantic
+aiofiles
