@@ -34,21 +34,21 @@
     - Write tests for authentication security and token handling
     - _Requirements: 1.1, 1.3_
 
-- [ ] 4. Implement task queue system with Celery
-  - [ ] 4.1 Set up Celery configuration and worker infrastructure
+- [-] 4. Implement task queue system with Celery
+  - [x] 4.1 Set up Celery configuration and worker infrastructure
     - Configure Celery with Redis broker and result backend
     - Create worker configuration with resource limits and routing
     - Implement worker health monitoring and automatic restart
     - _Requirements: 2.1, 2.2, 4.1, 4.2_
 
-  - [ ] 4.2 Create embedding worker tasks with progress tracking
+  - [x] 4.2 Create embedding worker tasks with progress tracking
     - Implement document processing task with user isolation
     - Add progress reporting and status updates to Redis
     - Create error handling and retry logic for failed embeddings
     - Write tests for concurrent embedding processing and resource limits
     - _Requirements: 2.1, 2.2, 4.4, 6.2_
 
-  - [ ] 4.3 Create query worker tasks with security isolation
+  - [x] 4.3 Create query worker tasks with security isolation
     - Implement query processing task with proper user filtering
     - Add query result caching and performance optimization
     - Create security validation to prevent data leakage
