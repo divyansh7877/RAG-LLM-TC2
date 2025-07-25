@@ -1,36 +1,133 @@
 """
 FastAPI application main module.
 """
-from fastapi import FastAPI, HTTPException, Depends, status
+import logging
+import time
+import uuid
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPBearer
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
 import uvicorn
 
 from ..shared.config import config
 from ..shared.redis_client import redis_client
+from ..shared.middleware import auth_middleware, rate_limiter
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Security
 security = HTTPBearer()
+
+
+class RequestLoggingMiddleware:
+    """Middleware for request logging and monitoring."""
+    
+    def __init__(self, app: FastAPI):
+        self.app = app
+    
+    async def __call__(self, request: Request, call_next):
+        """Process request with logging and monitoring."""
+        # Generate request ID
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        
+        # Log request start
+        start_time = time.time()
+        client_ip = request.client.host if request.client else "unknown"
+        
+        logger.info(
+            f"Request started - ID: {request_id}, Method: {request.method}, "
+            f"Path: {request.url.path}, Client: {client_ip}"
+        )
+        
+        try:
+            # Process request
+            response = await call_next(request)
+            
+            # Log successful response
+            process_time = time.time() - start_time
+            logger.info(
+                f"Request completed - ID: {request_id}, Status: {response.status_code}, "
+                f"Time: {process_time:.3f}s"
+            )
+            
+            # Add request ID to response headers
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = f"{process_time:.3f}"
+            
+            return response
+            
+        except Exception as e:
+            # Log error
+            process_time = time.time() - start_time
+            logger.error(
+                f"Request failed - ID: {request_id}, Error: {str(e)}, "
+                f"Time: {process_time:.3f}s"
+            )
+            
+            # Return structured error response
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "INTERNAL_SERVER_ERROR",
+                        "message": "An internal server error occurred",
+                        "request_id": request_id,
+                        "timestamp": datetime.utcnow().isoformat() + "Z"
+                    }
+                },
+                headers={"X-Request-ID": request_id}
+            )
+
+
+class ResponseFormattingMiddleware:
+    """Middleware for consistent response formatting."""
+    
+    def __init__(self, app: FastAPI):
+        self.app = app
+    
+    async def __call__(self, request: Request, call_next):
+        """Process response with consistent formatting."""
+        response = await call_next(request)
+        
+        # Add standard headers
+        response.headers["X-API-Version"] = "1.0.0"
+        response.headers["X-Timestamp"] = datetime.utcnow().isoformat() + "Z"
+        
+        return response
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
-    print("Starting FastAPI application...")
+    logger.info("Starting FastAPI application...")
     
     # Check Redis connection
     if not redis_client.health_check():
-        print("Warning: Redis connection failed")
+        logger.warning("Redis connection failed")
     else:
-        print("Redis connection successful")
+        logger.info("Redis connection successful")
+    
+    # Initialize middleware components
+    logger.info("Initializing middleware components...")
     
     yield
     
     # Shutdown
-    print("Shutting down FastAPI application...")
+    logger.info("Shutting down FastAPI application...")
 
 
 # Create FastAPI app
@@ -38,23 +135,102 @@ app = FastAPI(
     title="Concurrent RAG System",
     description="Multi-user RAG system with concurrent processing",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json"
 )
+
+# Add security middleware
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])  # Configure for production
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Add custom middleware
+app.middleware("http")(RequestLoggingMiddleware(app))
+app.middleware("http")(ResponseFormattingMiddleware(app))
+
+
+# Global exception handlers
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle request validation errors."""
+    request_id = getattr(request.state, 'request_id', 'unknown')
+    
+    logger.warning(f"Validation error - Request ID: {request_id}, Errors: {exc.errors()}")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": exc.errors(),
+                "request_id": request_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        },
+        headers={"X-Request-ID": request_id}
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with consistent formatting."""
+    request_id = getattr(request.state, 'request_id', 'unknown')
+    
+    logger.warning(f"HTTP exception - Request ID: {request_id}, Status: {exc.status_code}, Detail: {exc.detail}")
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": "HTTP_ERROR",
+                "message": exc.detail,
+                "request_id": request_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        },
+        headers={"X-Request-ID": request_id}
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions."""
+    request_id = getattr(request.state, 'request_id', 'unknown')
+    
+    logger.error(f"Unhandled exception - Request ID: {request_id}, Error: {str(exc)}", exc_info=True)
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "An internal server error occurred",
+                "request_id": request_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        },
+        headers={"X-Request-ID": request_id}
+    )
 
 
 @app.get("/")
 async def root():
     """Root endpoint."""
-    return {"message": "Concurrent RAG System API", "version": "1.0.0"}
+    return {
+        "message": "Concurrent RAG System API",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
 
 
 @app.get("/health")
@@ -64,12 +240,1494 @@ async def health_check():
     
     return {
         "status": "healthy" if redis_healthy else "unhealthy",
-        "redis": redis_healthy,
-        "timestamp": "2025-01-21T10:30:00Z"  # TODO: Use actual timestamp
+        "services": {
+            "redis": redis_healthy,
+            "api": True
+        },
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
 
-# TODO: Add authentication, document, query, and WebSocket endpoints in subsequent tasks
+@app.get("/api/status")
+async def api_status():
+    """Detailed API status endpoint."""
+    try:
+        # Check various system components
+        redis_healthy = redis_client.health_check()
+        
+        # TODO: Add checks for other components (Celery workers, database, etc.)
+        
+        status = {
+            "api_version": "1.0.0",
+            "status": "operational",
+            "services": {
+                "redis": {
+                    "status": "healthy" if redis_healthy else "unhealthy",
+                    "last_check": datetime.utcnow().isoformat() + "Z"
+                },
+                "authentication": {
+                    "status": "healthy",
+                    "last_check": datetime.utcnow().isoformat() + "Z"
+                }
+            },
+            "resource_usage": {
+                # TODO: Add actual resource monitoring
+                "memory_usage": "unknown",
+                "cpu_usage": "unknown",
+                "active_connections": "unknown"
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        overall_healthy = all(
+            service.get("status") == "healthy" 
+            for service in status["services"].values()
+        )
+        
+        if not overall_healthy:
+            status["status"] = "degraded"
+        
+        return status
+        
+    except Exception as e:
+        logger.error(f"Status check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": "Unable to determine system status",
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }
+            }
+        )
+
+
+# Authentication endpoints
+from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
+from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
+from ..shared.middleware import get_current_user, get_current_user_optional, rate_limiter, validate_token
+
+
+@app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
+async def login(
+    request: Request,
+    login_data: LoginRequest,
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 300))  # 5 attempts per 5 minutes
+):
+    """
+    Authenticate user and create session.
+    
+    Args:
+        request: FastAPI request object
+        login_data: Login credentials
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        LoginResponse: Authentication token and user info
+    
+    Raises:
+        HTTPException: If authentication fails
+    """
+    try:
+        # Authenticate user
+        auth_result = auth_manager.authenticate_user(
+            username=login_data.username,
+            password=login_data.password
+        )
+        
+        logger.info(f"User {login_data.username} logged in successfully")
+        
+        return LoginResponse(
+            access_token=auth_result["access_token"],
+            token_type=auth_result["token_type"],
+            user_id=auth_result["user_id"],
+            groups=auth_result["groups"]
+        )
+    
+    except InvalidCredentialsError:
+        logger.warning(f"Invalid login attempt for user {login_data.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    except AuthenticationError as e:
+        logger.error(f"Authentication error for user {login_data.username}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service error"
+        )
+    
+    except Exception as e:
+        logger.error(f"Unexpected login error for user {login_data.username}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login service temporarily unavailable"
+        )
+
+
+@app.post("/api/auth/logout", tags=["Authentication"])
+async def logout(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Logout user and invalidate session.
+    
+    Args:
+        request: FastAPI request object
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Logout confirmation
+    """
+    try:
+        # Get token from request headers
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authorization header"
+            )
+        
+        token = auth_header.split(" ")[1]
+        
+        # Logout user
+        success = auth_manager.logout_user(token)
+        
+        if success:
+            logger.info(f"User {current_user.user_id} logged out successfully")
+            return {
+                "message": "Logged out successfully",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Logout failed"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Logout error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Logout service error"
+        )
+
+
+@app.get("/api/auth/session", tags=["Authentication"])
+async def get_session_info(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get current session information.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Session information
+    """
+    try:
+        return {
+            "session_id": current_user.session_id,
+            "user_id": current_user.user_id,
+            "groups": current_user.groups,
+            "permissions": current_user.permissions,
+            "created_at": current_user.created_at.isoformat() + "Z",
+            "last_activity": current_user.last_activity.isoformat() + "Z",
+            "is_active": current_user.is_active
+        }
+    
+    except Exception as e:
+        logger.error(f"Session info error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Session service error"
+        )
+
+
+@app.post("/api/auth/refresh", tags=["Authentication"])
+async def refresh_token(
+    request: Request,
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 refreshes per 5 minutes
+):
+    """
+    Refresh access token.
+    
+    Args:
+        request: FastAPI request object
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: New access token
+    
+    Raises:
+        HTTPException: If token refresh fails
+    """
+    try:
+        # Get token from request headers
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authorization header"
+            )
+        
+        token = auth_header.split(" ")[1]
+        
+        # Refresh token
+        refresh_result = auth_manager.refresh_token(token)
+        
+        logger.info(f"Token refreshed for user {refresh_result['user_id']}")
+        
+        return {
+            "access_token": refresh_result["access_token"],
+            "token_type": refresh_result["token_type"],
+            "user_id": refresh_result["user_id"],
+            "groups": refresh_result["groups"],
+            "permissions": refresh_result["permissions"],
+            "expires_in": refresh_result["expires_in"]
+        }
+    
+    except TokenExpiredError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired and cannot be refreshed",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    except TokenInvalidError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {e}",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    except AuthenticationError as e:
+        logger.error(f"Token refresh error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Token refresh service error"
+        )
+    
+    except Exception as e:
+        logger.error(f"Unexpected token refresh error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Token refresh service temporarily unavailable"
+        )
+
+
+@app.post("/api/auth/validate", tags=["Authentication"])
+async def validate_token_endpoint(
+    token_info: dict = Depends(validate_token)
+):
+    """
+    Validate access token.
+    
+    Args:
+        token_info: Token validation result from middleware
+    
+    Returns:
+        dict: Token validation result
+    """
+    return {
+        "valid": token_info["valid"],
+        "user_info": token_info["user_info"],
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+# Document management endpoints
+import tempfile
+import shutil
+from pathlib import Path
+from fastapi import UploadFile, File, Form
+from typing import List
+from ..shared.job_manager import job_manager, JobType
+from ..workers.celery_app import celery_app
+
+@app.post("/api/documents/upload", tags=["Documents"])
+async def upload_documents(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    group_id: str = Form(...),
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 uploads per 5 minutes
+):
+    """
+    Upload documents for processing.
+    
+    Args:
+        request: FastAPI request object
+        files: List of uploaded files
+        group_id: Group ID for document organization
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Upload result with job information
+    
+    Raises:
+        HTTPException: If upload fails
+    """
+    temp_dir = None
+    temp_files = []
+    
+    try:
+        # Validate permissions
+        if not current_user.has_permission("upload"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have upload permission"
+            )
+        
+        # Validate group access
+        if group_id not in current_user.groups:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"User does not have access to group: {group_id}"
+            )
+        
+        # Validate files
+        if not files or len(files) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No files provided"
+            )
+        
+        if len(files) > 10:  # Limit number of files per upload
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Maximum 10 files allowed per upload"
+            )
+        
+        # Create temporary directory for file processing
+        temp_dir = tempfile.mkdtemp(prefix="rag_upload_")
+        
+        # Process and validate each file
+        for file in files:
+            # Validate file type
+            if not file.filename.lower().endswith('.pdf'):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Only PDF files are supported. Invalid file: {file.filename}"
+                )
+            
+            # Validate file size (max 50MB per file)
+            if file.size and file.size > 50 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File too large: {file.filename}. Maximum size is 50MB"
+                )
+            
+            # Save file to temporary location
+            temp_file_path = Path(temp_dir) / file.filename
+            try:
+                with open(temp_file_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+                temp_files.append(str(temp_file_path))
+            except Exception as e:
+                logger.error(f"Failed to save uploaded file {file.filename}: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to save file: {file.filename}"
+                )
+        
+        # Create embedding job
+        job = job_manager.create_job(
+            user_id=current_user.user_id,
+            job_type=JobType.EMBEDDING,
+            metadata={
+                "group_id": group_id,
+                "file_count": len(temp_files),
+                "filenames": [Path(f).name for f in temp_files],
+                "temp_dir": temp_dir,
+                "upload_source": "api"
+            }
+        )
+        
+        # Queue embedding task
+        from ..workers.embedding_worker import process_document_embedding
+        task = process_document_embedding.delay(
+            job_id=job.job_id,
+            user_id=current_user.user_id,
+            group_id=group_id,
+            file_paths=temp_files
+        )
+        
+        # Update job with task ID
+        job.metadata["celery_task_id"] = task.id
+        redis_client.set_job(job)
+        
+        logger.info(f"Created embedding job {job.job_id} for user {current_user.user_id} with {len(temp_files)} files")
+        
+        return {
+            "job_id": job.job_id,
+            "message": f"Upload successful. Processing {len(temp_files)} files.",
+            "files_count": len(temp_files),
+            "filenames": [Path(f).name for f in temp_files],
+            "status": "queued",
+            "estimated_processing_time": f"{len(temp_files) * 30} seconds"
+        }
+    
+    except HTTPException:
+        # Clean up temp files on HTTP errors
+        if temp_dir and Path(temp_dir).exists():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp directory after error: {e}")
+        raise
+    
+    except Exception as e:
+        # Clean up temp files on unexpected errors
+        if temp_dir and Path(temp_dir).exists():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp directory after error: {e}")
+        
+        logger.error(f"Document upload error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document upload service error"
+        )
+
+
+@app.get("/api/documents", tags=["Documents"])
+async def list_documents(
+    request: Request,
+    group_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's documents with filtering and pagination.
+    
+    Args:
+        request: FastAPI request object
+        group_id: Optional group filter
+        status: Optional status filter
+        limit: Maximum number of documents to return
+        offset: Number of documents to skip
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of documents with metadata
+    """
+    try:
+        # Validate group access if specified
+        if group_id and group_id not in current_user.groups:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"User does not have access to group: {group_id}"
+            )
+        
+        # Get documents from Redis
+        documents = []
+        
+        # Search for user's documents across all groups or specific group
+        groups_to_search = [group_id] if group_id else current_user.groups
+        
+        for group in groups_to_search:
+            pattern = f"document:{current_user.user_id}:{group}:*"
+            with redis_client.get_connection() as client:
+                keys = client.keys(pattern)
+            
+            for key in keys:
+                try:
+                    doc_data = redis_client.get_json(key.decode('utf-8'))
+                    if doc_data:
+                        # Apply status filter if specified
+                        if status and doc_data.get('processing_status') != status:
+                            continue
+                        
+                        # Convert to Document model for validation
+                        document = Document.from_dict(doc_data)
+                        documents.append(document.to_dict())
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to parse document data from key {key}: {e}")
+                    continue
+        
+        # Sort by upload date (newest first)
+        documents.sort(key=lambda x: x.get('upload_date', 0), reverse=True)
+        
+        # Apply pagination
+        total_count = len(documents)
+        paginated_documents = documents[offset:offset + limit]
+        
+        return {
+            "documents": paginated_documents,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < total_count
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing documents for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document listing service error"
+        )
+
+
+@app.get("/api/documents/{document_id}", tags=["Documents"])
+async def get_document(
+    document_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get specific document metadata.
+    
+    Args:
+        document_id: Document identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Document metadata
+    
+    Raises:
+        HTTPException: If document not found or access denied
+    """
+    try:
+        # Search for document across user's groups
+        document = None
+        for group_id in current_user.groups:
+            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(doc_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        return document.to_dict()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document {document_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document retrieval service error"
+        )
+
+
+@app.delete("/api/documents/{document_id}", tags=["Documents"])
+async def delete_document(
+    document_id: str,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
+):
+    """
+    Delete a document and its associated data.
+    
+    Args:
+        document_id: Document identifier
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Deletion confirmation
+    
+    Raises:
+        HTTPException: If document not found or deletion fails
+    """
+    try:
+        # Validate permissions
+        if not current_user.has_permission("delete"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have delete permission"
+            )
+        
+        # Find and validate document ownership
+        document = None
+        doc_key = None
+        for group_id in current_user.groups:
+            potential_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(potential_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                doc_key = potential_key
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        # TODO: Delete associated vector embeddings from LanceDB
+        # This would require implementing a cleanup function in the embedding worker
+        # For now, we'll just delete the metadata
+        
+        # Delete document metadata from Redis
+        if not redis_client.delete(doc_key):
+            logger.warning(f"Failed to delete document metadata for {document_id}")
+        
+        logger.info(f"Deleted document {document_id} for user {current_user.user_id}")
+        
+        return {
+            "message": "Document deleted successfully",
+            "document_id": document_id,
+            "filename": document.filename,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting document {document_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document deletion service error"
+        )
+
+
+@app.get("/api/documents/{document_id}/status", tags=["Documents"])
+async def get_document_status(
+    document_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get document processing status and progress.
+    
+    Args:
+        document_id: Document identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Document status and processing information
+    """
+    try:
+        # Find document
+        document = None
+        for group_id in current_user.groups:
+            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(doc_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        # Get associated job information if available
+        job_info = None
+        
+        # Search for embedding jobs related to this document
+        user_jobs = job_manager.get_user_jobs(current_user.user_id, job_type=JobType.EMBEDDING)
+        for job in user_jobs:
+            if (job.metadata.get("group_id") == document.group_id and 
+                document.filename in job.metadata.get("filenames", [])):
+                job_info = {
+                    "job_id": job.job_id,
+                    "status": job.status.value,
+                    "progress": job.progress,
+                    "created_at": job.created_at.isoformat() + "Z",
+                    "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
+                    "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
+                    "error": job.error
+                }
+                break
+        
+        return {
+            "document_id": document.document_id,
+            "filename": document.filename,
+            "processing_status": document.processing_status,
+            "page_count": document.page_count,
+            "chunk_count": document.chunk_count,
+            "upload_date": document.upload_date.isoformat() + "Z" if hasattr(document.upload_date, 'isoformat') else document.upload_date,
+            "file_size": document.file_size,
+            "job_info": job_info
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document status service error"
+        )
+    """
+    Get document processing status and progress.
+    
+    Args:
+        document_id: Document identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Document status and processing information
+    """
+    try:
+        # Find document
+        document = None
+        for group_id in current_user.groups:
+            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(doc_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        # Get associated job information if available
+        job_info = None
+        
+        # Search for embedding jobs related to this document
+        user_jobs = job_manager.get_user_jobs(current_user.user_id, job_type=JobType.EMBEDDING)
+        for job in user_jobs:
+            if (job.metadata.get("group_id") == document.group_id and 
+                document.filename in job.metadata.get("filenames", [])):
+                job_info = {
+                    "job_id": job.job_id,
+                    "status": job.status.value,
+                    "progress": job.progress,
+                    "created_at": job.created_at.isoformat() + "Z",
+                    "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
+                    "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
+                    "error": job.error
+                }
+                break
+        
+        return {
+            "document_id": document.document_id,
+            "filename": document.filename,
+            "processing_status": document.processing_status,
+            "page_count": document.page_count,
+            "chunk_count": document.chunk_count,
+            "upload_date": document.upload_date.isoformat() + "Z" if hasattr(document.upload_date, 'isoformat') else document.upload_date,
+            "file_size": document.file_size,
+            "job_info": job_info
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document status service error"
+        )
+
+
+# User management endpoints (basic implementation)
+@app.post("/api/auth/register", tags=["Authentication"])
+async def register_user(
+    request: Request,
+    registration_data: dict,
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(3, 3600))  # 3 registrations per hour
+):
+    """
+    Register new user (basic implementation).
+    
+    Note: This is a basic implementation for development.
+    In production, implement proper user registration with email verification,
+    password strength requirements, and database storage.
+    
+    Args:
+        request: FastAPI request object
+        registration_data: User registration data
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Registration result
+    """
+    try:
+        # Basic validation
+        required_fields = ["username", "password", "groups"]
+        for field in required_fields:
+            if field not in registration_data:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Missing required field: {field}"
+                )
+        
+        username = registration_data["username"]
+        password = registration_data["password"]
+        groups = registration_data["groups"]
+        
+        # Check if user already exists
+        if username in config.USERS:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username already exists"
+            )
+        
+        # Basic password validation
+        if len(password) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must be at least 8 characters long"
+            )
+        
+        # Validate groups
+        valid_groups = {"assistance", "common_rules", "admin"}
+        for group in groups:
+            if group not in valid_groups:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid group: {group}"
+                )
+        
+        # Add user to config (in production, save to database)
+        config.USERS[username] = {
+            "password": password,
+            "groups": groups
+        }
+        
+        logger.info(f"User {username} registered successfully")
+        
+        return {
+            "message": "User registered successfully",
+            "username": username,
+            "groups": groups,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Registration service error"
+        )
+
+
+@app.post("/api/auth/change-password", tags=["Authentication"])
+async def change_password(
+    request: Request,
+    password_data: dict,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 3600))  # 5 changes per hour
+):
+    """
+    Change user password.
+    
+    Args:
+        request: FastAPI request object
+        password_data: Password change data
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Password change result
+    """
+    try:
+        # Validate input
+        if "current_password" not in password_data or "new_password" not in password_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing current_password or new_password"
+            )
+        
+        current_password = password_data["current_password"]
+        new_password = password_data["new_password"]
+        
+        # Verify current password
+        user_data = config.USERS.get(current_user.user_id)
+        if not user_data or user_data["password"] != current_password:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect"
+            )
+        
+        # Validate new password
+        if len(new_password) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password must be at least 8 characters long"
+            )
+        
+        if new_password == current_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password must be different from current password"
+            )
+        
+        # Update password (in production, hash and save to database)
+        config.USERS[current_user.user_id]["password"] = new_password
+        
+        # Invalidate all user sessions to force re-login
+        auth_manager.logout_all_user_sessions(current_user.user_id)
+        
+        logger.info(f"Password changed for user {current_user.user_id}")
+        
+        return {
+            "message": "Password changed successfully. Please log in again.",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Password change error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Password change service error"
+        )
+
+
+# Query processing endpoints
+from ..shared.models import QueryRequest, QueryResponse, Query, JobStatus
+from ..workers.query_worker import process_user_query
+
+
+@app.post("/api/query", tags=["Query"])
+async def submit_query(
+    request: Request,
+    query_data: QueryRequest,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(30, 300))  # 30 queries per 5 minutes
+):
+    """
+    Submit a query for processing with user context validation.
+    
+    Args:
+        request: FastAPI request object
+        query_data: Query request data
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Query submission result with query ID and status
+    
+    Raises:
+        HTTPException: If query submission fails
+    """
+    try:
+        # Validate permissions
+        if not current_user.has_permission("query"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have query permission"
+            )
+        
+        # Validate query text
+        if not query_data.query_text or not query_data.query_text.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Query text cannot be empty"
+            )
+        
+        # Check query length
+        if len(query_data.query_text) > 2000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Query text too long (maximum 2000 characters)"
+            )
+        
+        # Create query record
+        query = Query(
+            user_id=current_user.user_id,
+            query_text=query_data.query_text.strip(),
+            status="pending"
+        )
+        
+        # Store query in Redis
+        query_key = f"query:{query.query_id}"
+        redis_client.set_json(query_key, query.to_dict(), expire_seconds=3600)  # 1 hour expiration
+        
+        # Create job for tracking
+        job = job_manager.create_job(
+            user_id=current_user.user_id,
+            job_type=JobType.QUERY,
+            metadata={
+                "query_id": query.query_id,
+                "query_text": query_data.query_text.strip(),
+                "groups": current_user.groups,
+                "query_source": "api"
+            }
+        )
+        
+        # Queue query processing task
+        task = process_user_query.delay(
+            query_id=query.query_id,
+            user_id=current_user.user_id,
+            group_ids=current_user.groups,
+            query_text=query_data.query_text.strip()
+        )
+        
+        # Update job with task ID
+        job.metadata["celery_task_id"] = task.id
+        redis_client.set_job(job)
+        
+        # Update query with job ID
+        query_dict = query.to_dict()
+        query_dict["job_id"] = job.job_id
+        query_dict["task_id"] = task.id
+        redis_client.set_json(query_key, query_dict, expire_seconds=3600)
+        
+        logger.info(f"Created query {query.query_id} for user {current_user.user_id}")
+        
+        return {
+            "query_id": query.query_id,
+            "job_id": job.job_id,
+            "message": "Query submitted successfully",
+            "status": "pending",
+            "estimated_processing_time": "5-30 seconds"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Query submission error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query submission service error"
+        )
+
+
+@app.get("/api/query/{query_id}", tags=["Query"])
+async def get_query_result(
+    query_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get query result and status.
+    
+    Args:
+        query_id: Query identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Query result with answer, sources, and metadata
+    
+    Raises:
+        HTTPException: If query not found or access denied
+    """
+    try:
+        # Get query data from Redis
+        query_key = f"query:{query_id}"
+        query_data = redis_client.get_json(query_key)
+        
+        if not query_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found"
+            )
+        
+        # Validate user ownership
+        if query_data.get("user_id") != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this query"
+            )
+        
+        # Get associated job information if available
+        job_info = None
+        if "job_id" in query_data:
+            try:
+                job = job_manager.get_job(query_data["job_id"])
+                if job:
+                    job_info = {
+                        "job_id": job.job_id,
+                        "status": job.status.value,
+                        "progress": job.progress,
+                        "created_at": job.created_at.isoformat() + "Z",
+                        "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
+                        "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
+                        "error": job.error
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to get job info for query {query_id}: {e}")
+        
+        # Prepare response
+        response_data = {
+            "query_id": query_id,
+            "query_text": query_data.get("query_text"),
+            "status": query_data.get("status", "pending"),
+            "created_at": query_data.get("created_at"),
+            "processing_time": query_data.get("processing_time"),
+            "job_info": job_info
+        }
+        
+        # Add result data if query is completed
+        if query_data.get("status") == "completed" and "result" in query_data:
+            result = query_data["result"]
+            response_data.update({
+                "answer": result.get("answer"),
+                "sources": result.get("sources", []),
+                "result_count": result.get("result_count", 0),
+                "cached": result.get("cached", False),
+                "query_metadata": result.get("query_metadata", {})
+            })
+        
+        # Add error information if query failed
+        if query_data.get("status") == "failed":
+            response_data["error"] = query_data.get("error")
+            response_data["error_type"] = query_data.get("error_type")
+        
+        return response_data
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting query result {query_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query retrieval service error"
+        )
+
+
+@app.get("/api/query/{query_id}/status", tags=["Query"])
+async def get_query_status(
+    query_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get query processing status and progress.
+    
+    Args:
+        query_id: Query identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Query status and progress information
+    
+    Raises:
+        HTTPException: If query not found or access denied
+    """
+    try:
+        # Get query data from Redis
+        query_key = f"query:{query_id}"
+        query_data = redis_client.get_json(query_key)
+        
+        if not query_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found"
+            )
+        
+        # Validate user ownership
+        if query_data.get("user_id") != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this query"
+            )
+        
+        # Get Celery task status if available
+        task_status = None
+        if "task_id" in query_data:
+            try:
+                from celery.result import AsyncResult
+                task_result = AsyncResult(query_data["task_id"], app=celery_app)
+                task_status = {
+                    "task_id": query_data["task_id"],
+                    "state": task_result.state,
+                    "info": task_result.info if task_result.info else {}
+                }
+            except Exception as e:
+                logger.warning(f"Failed to get task status for query {query_id}: {e}")
+        
+        return {
+            "query_id": query_id,
+            "status": query_data.get("status", "pending"),
+            "progress": query_data.get("progress", 0.0),
+            "status_message": query_data.get("status_message"),
+            "created_at": query_data.get("created_at"),
+            "started_at": query_data.get("started_at"),
+            "completed_at": query_data.get("completed_at"),
+            "processing_time": query_data.get("processing_time"),
+            "error": query_data.get("error"),
+            "task_status": task_status,
+            "last_updated": query_data.get("last_updated")
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting query status {query_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query status service error"
+        )
+
+
+@app.get("/api/queries", tags=["Query"])
+async def list_user_queries(
+    request: Request,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's query history with filtering and pagination.
+    
+    Args:
+        request: FastAPI request object
+        status: Optional status filter (pending, processing, completed, failed)
+        limit: Maximum number of queries to return
+        offset: Number of queries to skip
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of queries with metadata
+    """
+    try:
+        # Validate status filter
+        if status and status not in ["pending", "processing", "completed", "failed"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status filter. Must be one of: pending, processing, completed, failed"
+            )
+        
+        # Validate pagination parameters
+        if limit < 1 or limit > 100:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Limit must be between 1 and 100"
+            )
+        
+        if offset < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Offset must be non-negative"
+            )
+        
+        # Get user's queries from Redis
+        queries = []
+        pattern = f"query:*"
+        
+        with redis_client.get_connection() as client:
+            keys = client.keys(pattern)
+        
+        for key in keys:
+            try:
+                query_data = redis_client.get_json(key.decode('utf-8'))
+                if query_data and query_data.get("user_id") == current_user.user_id:
+                    # Apply status filter if specified
+                    if status and query_data.get("status") != status:
+                        continue
+                    
+                    # Add query to results
+                    query_summary = {
+                        "query_id": query_data.get("query_id"),
+                        "query_text": query_data.get("query_text", "")[:100] + "..." if len(query_data.get("query_text", "")) > 100 else query_data.get("query_text", ""),
+                        "status": query_data.get("status", "pending"),
+                        "created_at": query_data.get("created_at"),
+                        "completed_at": query_data.get("completed_at"),
+                        "processing_time": query_data.get("processing_time"),
+                        "result_count": query_data.get("result", {}).get("result_count", 0) if query_data.get("result") else 0,
+                        "cached": query_data.get("result", {}).get("cached", False) if query_data.get("result") else False,
+                        "error": query_data.get("error")
+                    }
+                    queries.append(query_summary)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to parse query data from key {key}: {e}")
+                continue
+        
+        # Sort by creation time (newest first)
+        queries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        # Apply pagination
+        total_count = len(queries)
+        paginated_queries = queries[offset:offset + limit]
+        
+        return {
+            "queries": paginated_queries,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < total_count,
+            "status_filter": status
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing queries for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query listing service error"
+        )
+
+
+@app.delete("/api/query/{query_id}", tags=["Query"])
+async def delete_query(
+    query_id: str,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(50, 300))  # 50 deletions per 5 minutes
+):
+    """
+    Delete a query and its associated data.
+    
+    Args:
+        query_id: Query identifier
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Deletion confirmation
+    
+    Raises:
+        HTTPException: If query not found or deletion fails
+    """
+    try:
+        # Get query data from Redis
+        query_key = f"query:{query_id}"
+        query_data = redis_client.get_json(query_key)
+        
+        if not query_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found"
+            )
+        
+        # Validate user ownership
+        if query_data.get("user_id") != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this query"
+            )
+        
+        # Cancel Celery task if still running
+        if "task_id" in query_data and query_data.get("status") in ["pending", "processing"]:
+            try:
+                from celery.result import AsyncResult
+                task_result = AsyncResult(query_data["task_id"], app=celery_app)
+                task_result.revoke(terminate=True)
+                logger.info(f"Cancelled Celery task {query_data['task_id']} for query {query_id}")
+            except Exception as e:
+                logger.warning(f"Failed to cancel Celery task for query {query_id}: {e}")
+        
+        # Delete associated job if exists
+        if "job_id" in query_data:
+            try:
+                job = job_manager.get_job(query_data["job_id"])
+                if job:
+                    job.update_status(JobStatus.CANCELLED)
+                    redis_client.set_job(job)
+            except Exception as e:
+                logger.warning(f"Failed to cancel job for query {query_id}: {e}")
+        
+        # Delete query from Redis
+        if not redis_client.delete(query_key):
+            logger.warning(f"Failed to delete query data for {query_id}")
+        
+        logger.info(f"Deleted query {query_id} for user {current_user.user_id}")
+        
+        return {
+            "message": "Query deleted successfully",
+            "query_id": query_id,
+            "query_text": query_data.get("query_text", "")[:50] + "..." if len(query_data.get("query_text", "")) > 50 else query_data.get("query_text", ""),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting query {query_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query deletion service error"
+        )
+
+
+@app.get("/api/query/{query_id}/cache", tags=["Query"])
+async def get_query_cache_info(
+    query_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get query cache information and statistics.
+    
+    Args:
+        query_id: Query identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Cache information and statistics
+    """
+    try:
+        # Get query data from Redis
+        query_key = f"query:{query_id}"
+        query_data = redis_client.get_json(query_key)
+        
+        if not query_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found"
+            )
+        
+        # Validate user ownership
+        if query_data.get("user_id") != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this query"
+            )
+        
+        # Generate cache key for this query
+        from ..workers.query_worker import generate_cache_key
+        cache_key = generate_cache_key(
+            current_user.user_id,
+            current_user.groups,
+            query_data.get("query_text", "")
+        )
+        
+        # Check if result was cached
+        cached_result = query_data.get("result", {}).get("cached", False)
+        
+        # Get cache statistics
+        cache_info = {
+            "query_id": query_id,
+            "cache_key": cache_key,
+            "was_cached": cached_result,
+            "cache_available": False,
+            "cache_expires_at": None,
+            "cache_created_at": None
+        }
+        
+        # Check current cache status
+        try:
+            cached_data = redis_client.get_json(cache_key)
+            if cached_data:
+                cache_info.update({
+                    "cache_available": True,
+                    "cache_expires_at": datetime.fromtimestamp(cached_data.get("expires_at", 0)).isoformat() + "Z" if cached_data.get("expires_at") else None,
+                    "cache_created_at": datetime.fromtimestamp(cached_data.get("cached_at", 0)).isoformat() + "Z" if cached_data.get("cached_at") else None
+                })
+        except Exception as e:
+            logger.warning(f"Failed to check cache status for query {query_id}: {e}")
+        
+        return cache_info
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting cache info for query {query_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Cache info service error"
+        )
 
 
 if __name__ == "__main__":

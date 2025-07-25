@@ -70,28 +70,28 @@
     - Write tests for job state management and concurrent job handling
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
 
-- [ ] 6. Develop FastAPI web application
-  - [ ] 6.1 Create FastAPI application structure and middleware
+- [-] 6. Develop FastAPI web application
+  - [x] 6.1 Create FastAPI application structure and middleware
     - Set up FastAPI application with CORS, authentication, and error handling
     - Implement request validation and response formatting middleware
     - Add logging and monitoring middleware for request tracking
     - _Requirements: 3.1, 3.2, 5.1, 5.2_
 
-  - [ ] 6.2 Implement authentication and session API endpoints
+  - [x] 6.2 Implement authentication and session API endpoints
     - Create login, logout, and session validation endpoints
     - Add user registration and password management endpoints
     - Implement rate limiting for authentication endpoints
     - Write tests for authentication flow and security
     - _Requirements: 1.1, 1.3, 3.1_
 
-  - [ ] 6.3 Create document management API endpoints
+  - [x] 6.3 Create document management API endpoints
     - Implement file upload endpoint with validation and queuing
     - Add document listing, deletion, and metadata endpoints
     - Create document status tracking and progress reporting
     - Write tests for document operations and user isolation
     - _Requirements: 2.1, 2.2, 3.2, 6.1, 6.2_
 
-  - [ ] 6.4 Implement query processing API endpoints
+  - [x] 6.4 Implement query processing API endpoints
     - Create query submission endpoint with user context validation
     - Add query status tracking and result retrieval endpoints
     - Implement query history and caching functionality
