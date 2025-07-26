@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Test - Concurrent RAG System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .message {
+            background-color: #f8f9fa;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 3px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        button {
+            padding: 8px 16px;
+            margin: 5px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .btn-primary {
+            background-color: #007bff;
+            color: white;
+        }
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+        input[type="text"] {
+            width: 300px;
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        #messages {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            background-color: #f8f9fa;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Test - Concurrent RAG System</h1>
+    
+    <div class="test-section">
+        <h3>Connection Status</h3>
+        <div id="connectionStatus" class="status disconnected">Disconnected</div>
+        <button id="connectBtn" class="btn-primary">Connect</button>
+        <button id="disconnectBtn" class="btn-secondary" disabled>Disconnect</button>
+    </div>
+
+    <div class="test-section">
+        <h3>Authentication</h3>
+        <input type="text" id="tokenInput" placeholder="Enter JWT token">
+        <button id="authBtn" class="btn-primary">Authenticate</button>
+        <div id="authStatus"></div>
+    </div>
+
+    <div class="test-section">
+        <h3>Send Test Messages</h3>
+        <button id="pingBtn" class="btn-secondary" disabled>Send Ping</button>
+        <button id="subscribeBtn" class="btn-secondary" disabled>Subscribe to User Topic</button>
+        <button id="unsubscribeBtn" class="btn-secondary" disabled>Unsubscribe</button>
+        <br>
+        <input type="text" id="customMessage" placeholder="Custom message JSON">
+        <button id="sendCustomBtn" class="btn-secondary" disabled>Send Custom</button>
+    </div>
+
+    <div class="test-section">
+        <h3>Messages</h3>
+        <button id="clearBtn" class="btn-danger">Clear Messages</button>
+        <div id="messages"></div>
+    </div>
+
+    <script>
+        class WebSocketTester {
+            constructor() {
+                this.websocket = null;
+                this.token = null;
+                this.wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/updates`;
+                this.setupEventListeners();
+            }
+
+            setupEventListeners() {
+                document.getElementById('connectBtn').addEventListener('click', () => this.connect());
+                document.getElementById('disconnectBtn').addEventListener('click', () => this.disconnect());
+                document.getElementById('authBtn').addEventListener('click', () => this.authenticate());
+                document.getElementById('pingBtn').addEventListener('click', () => this.sendPing());
+                document.getElementById('subscribeBtn').addEventListener('click', () => this.subscribe());
+                document.getElementById('unsubscribeBtn').addEventListener('click', () => this.unsubscribe());
+                document.getElementById('sendCustomBtn').addEventListener('click', () => this.sendCustomMessage());
+                document.getElementById('clearBtn').addEventListener('click', () => this.clearMessages());
+            }
+
+            authenticate() {
+                this.token = document.getElementById('tokenInput').value.trim();
+                if (!this.token) {
+                    this.updateAuthStatus('Please enter a token', 'error');
+                    return;
+                }
+                this.updateAuthStatus('Token set successfully', 'success');
+                document.getElementById('connectBtn').disabled = false;
+            }
+
+            connect() {
+                if (!this.token) {
+                    this.updateAuthStatus('Please authenticate first', 'error');
+                    return;
+                }
+
+                try {
+                    const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.token)}`;
+                    this.websocket = new WebSocket(wsUrlWithToken);
+                    
+                    this.websocket.onopen = () => {
+                        this.updateConnectionStatus('connected');
+                        this.addMessage('WebSocket connected successfully', 'success');
+                        this.enableButtons(true);
+                    };
+
+                    this.websocket.onmessage = (event) => {
+                        try {
+                            const message = JSON.parse(event.data);
+                            this.addMessage(`Received: ${JSON.stringify(message, null, 2)}`, 'received');
+                        } catch (error) {
+                            this.addMessage(`Received (raw): ${event.data}`, 'received');
+                        }
+                    };
+
+                    this.websocket.onclose = (event) => {
+                        this.updateConnectionStatus('disconnected');
+                        this.addMessage(`WebSocket closed. Code: ${event.code}, Reason: ${event.reason}`, 'error');
+                        this.enableButtons(false);
+                    };
+
+                    this.websocket.onerror = (error) => {
+                        this.addMessage(`WebSocket error: ${error}`, 'error');
+                        this.updateConnectionStatus('disconnected');
+                    };
+
+                    this.updateConnectionStatus('connecting');
+                    
+                } catch (error) {
+                    this.addMessage(`Connection error: ${error.message}`, 'error');
+                    this.updateConnectionStatus('disconnected');
+                }
+            }
+
+            disconnect() {
+                if (this.websocket) {
+                    this.websocket.close();
+                    this.websocket = null;
+                }
+            }
+
+            sendPing() {
+                this.sendMessage({
+                    type: 'ping',
+                    timestamp: Date.now()
+                });
+            }
+
+            subscribe() {
+                this.sendMessage({
+                    type: 'subscribe',
+                    topic: 'user:test-user'
+                });
+            }
+
+            unsubscribe() {
+                this.sendMessage({
+                    type: 'unsubscribe',
+                    topic: 'user:test-user'
+                });
+            }
+
+            sendCustomMessage() {
+                const customInput = document.getElementById('customMessage');
+                const messageText = customInput.value.trim();
+                
+                if (!messageText) {
+                    this.addMessage('Please enter a custom message', 'error');
+                    return;
+                }
+
+                try {
+                    const message = JSON.parse(messageText);
+                    this.sendMessage(message);
+                    customInput.value = '';
+                } catch (error) {
+                    this.addMessage(`Invalid JSON: ${error.message}`, 'error');
+                }
+            }
+
+            sendMessage(message) {
+                if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+                    this.addMessage('WebSocket is not connected', 'error');
+                    return;
+                }
+
+                try {
+                    const messageStr = JSON.stringify(message);
+                    this.websocket.send(messageStr);
+                    this.addMessage(`Sent: ${messageStr}`, 'sent');
+                } catch (error) {
+                    this.addMessage(`Send error: ${error.message}`, 'error');
+                }
+            }
+
+            updateConnectionStatus(status) {
+                const statusElement = document.getElementById('connectionStatus');
+                statusElement.className = `status ${status}`;
+                
+                switch (status) {
+                    case 'connected':
+                        statusElement.textContent = 'Connected';
+                        document.getElementById('connectBtn').disabled = true;
+                        document.getElementById('disconnectBtn').disabled = false;
+                        break;
+                    case 'connecting':
+                        statusElement.textContent = 'Connecting...';
+                        document.getElementById('connectBtn').disabled = true;
+                        document.getElementById('disconnectBtn').disabled = false;
+                        break;
+                    case 'disconnected':
+                        statusElement.textContent = 'Disconnected';
+                        document.getElementById('connectBtn').disabled = false;
+                        document.getElementById('disconnectBtn').disabled = true;
+                        break;
+                }
+            }
+
+            updateAuthStatus(message, type) {
+                const authStatus = document.getElementById('authStatus');
+                authStatus.textContent = message;
+                authStatus.className = `status ${type === 'error' ? 'disconnected' : 'connected'}`;
+            }
+
+            enableButtons(enabled) {
+                document.getElementById('pingBtn').disabled = !enabled;
+                document.getElementById('subscribeBtn').disabled = !enabled;
+                document.getElementById('unsubscribeBtn').disabled = !enabled;
+                document.getElementById('sendCustomBtn').disabled = !enabled;
+            }
+
+            addMessage(message, type) {
+                const messagesDiv = document.getElementById('messages');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message';
+                
+                const timestamp = new Date().toLocaleTimeString();
+                messageDiv.innerHTML = `<strong>[${timestamp}] ${type.toUpperCase()}:</strong><br>${message}`;
+                
+                messagesDiv.appendChild(messageDiv);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            clearMessages() {
+                document.getElementById('messages').innerHTML = '';
+            }
+        }
+
+        // Initialize the tester when DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            window.tester = new WebSocketTester();
+        });
+    </script>
+</body>
+</html>

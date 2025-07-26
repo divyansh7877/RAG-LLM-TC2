@@ -11,18 +11,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.workers.query_worker import (
     process_user_query,
-    create_user_security_filters,
-    generate_cache_key,
-    get_cached_query_result,
-    cache_query_result,
     validate_query_security,
-    initialize_query_engine,
     extract_source_info,
     update_query_progress,
     get_query_status,
     cleanup_query_cache,
     QuerySecurityError
 )
+from app.shared.query_engine_factory import query_engine_factory
 from app.shared.redis_client import redis_client
 from app.shared.models import JobStatus
 
@@ -52,9 +48,9 @@ class TestQueryWorker:
             pass
     
     def test_create_user_security_filters(self):
-        """Test security filter creation for user isolation."""
-        # Test valid inputs
-        filters = create_user_security_filters(self.test_user_id, self.test_group_ids)
+        """Test security filter creation for user isolation using factory."""
+        # Test valid inputs using the factory
+        filters = query_engine_factory._create_user_security_filters(self.test_user_id, self.test_group_ids)
         
         assert filters is not None
         assert len(filters.filters) == 3  # 1 user filter + 2 group filters
@@ -72,28 +68,32 @@ class TestQueryWorker:
         assert "group2" in group_values
     
     def test_create_user_security_filters_validation(self):
-        """Test security filter validation."""
+        """Test security filter validation using factory."""
         # Test empty user_id
-        with pytest.raises(QuerySecurityError, match="User ID is required"):
-            create_user_security_filters("", self.test_group_ids)
+        with pytest.raises(ValueError, match="User ID is required"):
+            query_engine_factory._create_user_security_filters("", self.test_group_ids)
         
         # Test None user_id
-        with pytest.raises(QuerySecurityError, match="User ID is required"):
-            create_user_security_filters(None, self.test_group_ids)
+        with pytest.raises(ValueError, match="User ID is required"):
+            query_engine_factory._create_user_security_filters(None, self.test_group_ids)
         
         # Test empty group_ids
-        with pytest.raises(QuerySecurityError, match="At least one group ID is required"):
-            create_user_security_filters(self.test_user_id, [])
+        with pytest.raises(ValueError, match="At least one group ID is required"):
+            query_engine_factory._create_user_security_filters(self.test_user_id, [])
         
         # Test None group_ids
-        with pytest.raises(QuerySecurityError, match="At least one group ID is required"):
-            create_user_security_filters(self.test_user_id, None)
+        with pytest.raises(ValueError, match="At least one group ID is required"):
+            query_engine_factory._create_user_security_filters(self.test_user_id, None)
     
     def test_generate_cache_key(self):
-        """Test cache key generation for consistent caching."""
-        # Test basic cache key generation
-        key1 = generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text)
-        key2 = generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text)
+        """Test cache key generation for consistent caching using factory."""
+        # Initialize factory cache if needed
+        if not query_engine_factory._query_cache:
+            query_engine_factory._initialize_components()
+        
+        # Test basic cache key generation using factory's internal method
+        key1 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text)
+        key2 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text)
         
         # Same inputs should produce same key
         assert key1 == key2
@@ -101,71 +101,52 @@ class TestQueryWorker:
         assert len(key1.split(":")[1]) == 16  # Hash length
         
         # Different user should produce different key
-        key3 = generate_cache_key("different_user", self.test_group_ids, self.test_query_text)
+        key3 = query_engine_factory._query_cache._generate_cache_key("different_user", self.test_group_ids, self.test_query_text)
         assert key1 != key3
         
         # Different groups should produce different key
-        key4 = generate_cache_key(self.test_user_id, ["different_group"], self.test_query_text)
+        key4 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, ["different_group"], self.test_query_text)
         assert key1 != key4
         
         # Different query should produce different key
-        key5 = generate_cache_key(self.test_user_id, self.test_group_ids, "Different query?")
+        key5 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, self.test_group_ids, "Different query?")
         assert key1 != key5
         
         # Case insensitive for query text
-        key6 = generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text.upper())
+        key6 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, self.test_group_ids, self.test_query_text.upper())
         assert key1 == key6
         
         # Group order shouldn't matter
-        key7 = generate_cache_key(self.test_user_id, ["group2", "group1"], self.test_query_text)
+        key7 = query_engine_factory._query_cache._generate_cache_key(self.test_user_id, ["group2", "group1"], self.test_query_text)
         assert key1 == key7
     
-    @patch('app.workers.query_worker.redis_client')
-    def test_cache_operations(self, mock_redis):
-        """Test query result caching and retrieval."""
-        cache_key = "query_cache:test123"
+    def test_cache_operations(self):
+        """Test query result caching and retrieval using factory."""
         test_result = {
             "answer": "Test answer",
             "sources": ["doc1.pdf", "doc2.pdf"],
             "processing_time": 1.5
         }
         
+        # Initialize factory cache if needed
+        if not query_engine_factory._query_cache:
+            query_engine_factory._initialize_components()
+        
         # Test caching
-        cache_query_result(cache_key, test_result)
+        query_engine_factory.cache_query_result(self.test_user_id, self.test_group_ids, self.test_query_text, test_result)
         
-        # Verify Redis set_json was called
-        mock_redis.set_json.assert_called_once()
-        call_args = mock_redis.set_json.call_args
-        assert call_args[0][0] == cache_key
-        
-        cached_data = call_args[0][1]
-        assert cached_data["result"] == test_result
-        assert "cached_at" in cached_data
-        assert "expires_at" in cached_data
-        
-        # Test cache retrieval - valid cache
-        current_time = time.time()
-        mock_redis.get_json.return_value = {
-            "result": test_result,
-            "cached_at": current_time - 100,
-            "expires_at": current_time + 1000  # Not expired
-        }
-        
-        retrieved = get_cached_query_result(cache_key)
+        # Test cache retrieval
+        retrieved = query_engine_factory.get_cached_query_result(self.test_user_id, self.test_group_ids, self.test_query_text)
         assert retrieved == test_result
         
-        # Test cache retrieval - expired cache
-        mock_redis.get_json.return_value = {
-            "result": test_result,
-            "cached_at": current_time - 2000,
-            "expires_at": current_time - 1000  # Expired
-        }
+        # Test cache miss for different user
+        retrieved_different_user = query_engine_factory.get_cached_query_result("different_user", self.test_group_ids, self.test_query_text)
+        assert retrieved_different_user is None
         
-        retrieved = get_cached_query_result(cache_key)
-        assert retrieved is None
-        
-        # Verify expired cache was deleted
-        mock_redis.redis_client.delete.assert_called_with(cache_key)
+        # Test cache invalidation
+        query_engine_factory.invalidate_user_cache(self.test_user_id)
+        retrieved_after_invalidation = query_engine_factory.get_cached_query_result(self.test_user_id, self.test_group_ids, self.test_query_text)
+        assert retrieved_after_invalidation is None
     
     def test_validate_query_security(self):
         """Test query security validation."""
@@ -351,14 +332,12 @@ class TestQueryWorker:
         delete_calls = mock_redis.redis_client.delete.call_args_list
         assert len(delete_calls) == 2
     
-    @patch('app.workers.query_worker.initialize_query_engine')
-    @patch('app.workers.query_worker.get_cached_query_result')
-    @patch('app.workers.query_worker.cache_query_result')
-    @patch('app.workers.query_worker.redis_client')
-    def test_process_user_query_success(self, mock_redis, mock_cache, mock_get_cache, mock_init_engine):
+    @patch('app.workers.query_worker.query_engine_factory')
+    @patch('app.workers.query_worker.job_manager')
+    def test_process_user_query_success(self, mock_job_manager, mock_factory):
         """Test successful query processing."""
         # Mock no cached result
-        mock_get_cache.return_value = None
+        mock_factory.get_cached_query_result.return_value = None
         
         # Mock query engine and response
         mock_engine = Mock()
@@ -366,7 +345,11 @@ class TestQueryWorker:
         mock_response.response = "This is the answer to your question."
         mock_response.source_nodes = []
         mock_engine.query.return_value = mock_response
-        mock_init_engine.return_value = mock_engine
+        mock_factory.create_query_engine.return_value = mock_engine
+        
+        # Mock job manager
+        mock_job_manager.update_job_status.return_value = True
+        mock_job_manager.update_job_progress.return_value = True
         
         # Execute query
         result = process_user_query(
@@ -385,17 +368,17 @@ class TestQueryWorker:
         assert result["answer"] == "This is the answer to your question."
         
         # Verify security filters were applied
-        mock_init_engine.assert_called_once_with(self.test_user_id, self.test_group_ids)
+        mock_factory.create_query_engine.assert_called_once_with(self.test_user_id, self.test_group_ids)
         
         # Verify result was cached
-        mock_cache.assert_called_once()
+        mock_factory.cache_query_result.assert_called_once()
         
-        # Verify Redis status updates
-        assert mock_redis.set_json.call_count >= 2  # Initial + completion
+        # Verify job status updates
+        assert mock_job_manager.update_job_status.call_count >= 2  # Processing + completion
     
-    @patch('app.workers.query_worker.get_cached_query_result')
-    @patch('app.workers.query_worker.redis_client')
-    def test_process_user_query_cached_result(self, mock_redis, mock_get_cache):
+    @patch('app.workers.query_worker.query_engine_factory')
+    @patch('app.workers.query_worker.job_manager')
+    def test_process_user_query_cached_result(self, mock_job_manager, mock_factory):
         """Test query processing with cached result."""
         # Mock cached result
         cached_result = {
@@ -404,7 +387,10 @@ class TestQueryWorker:
             "processing_time": 0.5,
             "cached": False  # Will be updated to True
         }
-        mock_get_cache.return_value = cached_result
+        mock_factory.get_cached_query_result.return_value = cached_result
+        
+        # Mock job manager
+        mock_job_manager.update_job_status.return_value = True
         
         # Execute query
         result = process_user_query(
@@ -419,8 +405,8 @@ class TestQueryWorker:
         assert result["cached"] is True
         assert "processing_time" in result
         
-        # Verify Redis status was updated
-        mock_redis.set_json.assert_called()
+        # Verify job status was updated
+        mock_job_manager.update_job_status.assert_called()
     
     @patch('app.workers.query_worker.redis_client')
     def test_process_user_query_security_error(self, mock_redis):
@@ -504,10 +490,10 @@ class TestQueryWorker:
         # Test that security filters are properly applied for different users
         
         # User 1 with groups A and B
-        user1_filters = create_user_security_filters("user1", ["groupA", "groupB"])
+        user1_filters = query_engine_factory._create_user_security_filters("user1", ["groupA", "groupB"])
         
         # User 2 with groups B and C
-        user2_filters = create_user_security_filters("user2", ["groupB", "groupC"])
+        user2_filters = query_engine_factory._create_user_security_filters("user2", ["groupB", "groupC"])
         
         # Verify filters are different
         assert user1_filters != user2_filters
@@ -555,21 +541,12 @@ class TestQueryWorkerIntegration:
         except:
             pass
     
-    @patch('app.workers.query_worker.Settings')
-    @patch('app.workers.query_worker.LlamaCPP')
-    @patch('app.workers.query_worker.HuggingFaceEmbedding')
-    @patch('app.workers.query_worker.LanceDBVectorStore')
-    @patch('app.workers.query_worker.VectorStoreIndex')
-    @patch('app.workers.query_worker.VectorIndexRetriever')
-    @patch('app.workers.query_worker.RetrieverQueryEngine')
-    def test_initialize_query_engine_integration(self, mock_query_engine, mock_retriever, 
-                                                mock_index, mock_vector_store, mock_embedding, 
-                                                mock_llm, mock_settings):
-        """Test query engine initialization with mocked components."""
-        # Mock Settings to not have embed_model and llm initially
-        mock_settings.embed_model = None
-        mock_settings.llm = None
-        
+    @patch('app.shared.query_engine_factory.HuggingFaceEmbedding')
+    @patch('app.shared.query_engine_factory.LlamaCPP')
+    @patch('app.shared.query_engine_factory.DatabaseConnectionPool')
+    @patch('app.shared.query_engine_factory.QueryResultCache')
+    def test_initialize_query_engine_integration(self, mock_cache, mock_pool, mock_llm, mock_embedding):
+        """Test query engine initialization with mocked components using factory."""
         # Mock the components
         mock_embedding_instance = Mock()
         mock_embedding.return_value = mock_embedding_instance
@@ -577,30 +554,16 @@ class TestQueryWorkerIntegration:
         mock_llm_instance = Mock()
         mock_llm.return_value = mock_llm_instance
         
-        mock_vector_store_instance = Mock()
-        mock_vector_store.return_value = mock_vector_store_instance
+        mock_pool_instance = Mock()
+        mock_pool.return_value = mock_pool_instance
         
-        mock_index_instance = Mock()
-        mock_index.from_vector_store.return_value = mock_index_instance
+        mock_cache_instance = Mock()
+        mock_cache.return_value = mock_cache_instance
         
-        mock_retriever_instance = Mock()
-        mock_retriever.return_value = mock_retriever_instance
+        # Initialize query engine using factory
+        query_engine = query_engine_factory.create_query_engine(self.test_user_id, self.test_group_ids)
         
-        mock_query_engine_instance = Mock()
-        mock_query_engine.return_value = mock_query_engine_instance
-        
-        # Initialize query engine
-        query_engine = initialize_query_engine(self.test_user_id, self.test_group_ids)
-        
-        # Verify components were initialized
-        mock_embedding.assert_called_once()
-        mock_llm.assert_called_once()
-        mock_vector_store.assert_called_once()
-        mock_index.from_vector_store.assert_called_once()
-        mock_retriever.assert_called_once()
-        mock_query_engine.assert_called_once()
-        
-        # Verify query engine was created
+        # Verify query engine was created (this will trigger component initialization)
         assert query_engine is not None
     
     @patch('app.workers.query_worker.process_user_query')

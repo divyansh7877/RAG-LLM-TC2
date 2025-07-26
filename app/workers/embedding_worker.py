@@ -14,6 +14,7 @@ from .celery_app import celery_app
 from ..shared.redis_client import redis_client
 from ..shared.models import JobStatus, Document
 from ..shared.config import config
+from ..shared.job_manager import job_manager
 
 # Import embedding functionality
 import fitz  # PyMuPDF
@@ -180,19 +181,15 @@ def store_document_metadata(user_id: str, group_id: str, file_path: str,
 
 
 def update_job_progress(job_id: str, progress: float, status_message: str = None):
-    """Update job progress in Redis and Celery state."""
+    """Update job progress using job manager and trigger WebSocket notifications."""
     try:
-        # Update Redis
-        job_key = f"job:{job_id}"
-        job_data = redis_client.get_json(job_key)
-        if job_data:
-            job_data["progress"] = progress
-            job_data["last_updated"] = time.time()
-            if status_message:
-                job_data["status_message"] = status_message
-            redis_client.set_json(job_key, job_data)
+        # Update job progress through job manager (this will trigger WebSocket notifications)
+        success = job_manager.update_job_progress(job_id, progress, status_message)
         
-        # Update Celery task state
+        if not success:
+            logger.warning(f"Failed to update job progress for {job_id}")
+        
+        # Update Celery task state for Celery monitoring
         if current_task:
             current_task.update_state(
                 state="PROGRESS",
@@ -237,20 +234,8 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         if not isinstance(file_paths, list) or len(file_paths) == 0:
             raise ValueError("file_paths must be a non-empty list")
         
-        # Initialize job status
-        job_data = {
-            "job_id": job_id,
-            "user_id": user_id,
-            "job_type": "embedding",
-            "status": JobStatus.PROCESSING.value,
-            "progress": 0.0,
-            "started_at": time.time(),
-            "total_files": len(file_paths),
-            "processed_files": 0,
-            "failed_files": 0,
-            "status_message": "Initializing embedding process..."
-        }
-        redis_client.set_json(f"job:{job_id}", job_data)
+        # Update job status to processing (this will trigger WebSocket notification)
+        job_manager.update_job_status(job_id, JobStatus.PROCESSING)
         
         logger.info(f"Starting embedding job {job_id} for user {user_id}, group {group_id}, {len(file_paths)} files")
         
@@ -363,15 +348,8 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
             "message": f"Successfully processed {len(processed_files)} of {total_files} files"
         }
         
-        job_data.update({
-            "status": JobStatus.COMPLETED.value,
-            "progress": 1.0,
-            "completed_at": time.time(),
-            "result": result,
-            "processed_files": len(processed_files),
-            "failed_files": len(failed_files)
-        })
-        redis_client.set_json(f"job:{job_id}", job_data)
+        # Update job status to completed (this will trigger WebSocket notification)
+        job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
         
         logger.info(f"Completed embedding job {job_id}: {len(processed_files)} processed, {len(failed_files)} failed")
         return result
@@ -379,25 +357,14 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
     except Exception as e:
         logger.error(f"Embedding job {job_id} failed: {e}")
         
-        # Mark job as failed
-        error_message = str(e)
-        job_data = {
-            "job_id": job_id,
-            "user_id": user_id,
-            "job_type": "embedding",
-            "status": JobStatus.FAILED.value,
-            "progress": 0.0,
-            "error": error_message,
-            "completed_at": time.time(),
-            "processed_files": len(processed_files),
-            "failed_files": len(failed_files) + 1  # Include current failure
-        }
-        redis_client.set_json(f"job:{job_id}", job_data)
-        
         # Check if this is a retryable error
         if isinstance(e, (ConnectionError, TimeoutError)) and self.request.retries < 3:
             logger.info(f"Retrying job {job_id} due to {type(e).__name__}")
             raise self.retry(countdown=60, exc=e)
+        
+        # Mark job as failed (this will trigger WebSocket notification)
+        error_message = str(e)
+        job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_message)
         
         # Re-raise for Celery error handling
         raise

@@ -13,6 +13,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPBearer
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import uvicorn
 
@@ -124,6 +125,11 @@ async def lifespan(app: FastAPI):
     # Initialize middleware components
     logger.info("Initializing middleware components...")
     
+    # Initialize job notification service
+    from ..shared.job_notifications import job_notification_service
+    job_notification_service.initialize()
+    logger.info("Job notification service initialized")
+    
     yield
     
     # Shutdown
@@ -156,6 +162,12 @@ app.add_middleware(
 # Add custom middleware
 app.middleware("http")(RequestLoggingMiddleware(app))
 app.middleware("http")(ResponseFormattingMiddleware(app))
+
+# Mount static files
+from pathlib import Path
+from fastapi.responses import FileResponse
+static_dir = Path(__file__).parent.parent / "static"
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 # Global exception handlers
@@ -224,8 +236,20 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 @app.get("/")
-async def root():
-    """Root endpoint."""
+async def serve_frontend():
+    """Serve the main frontend application."""
+    static_dir = Path(__file__).parent.parent / "static"
+    return FileResponse(str(static_dir / "index.html"))
+
+@app.get("/app")
+async def serve_app():
+    """Alternative route to serve the frontend application."""
+    static_dir = Path(__file__).parent.parent / "static"
+    return FileResponse(str(static_dir / "index.html"))
+
+@app.get("/api")
+async def api_root():
+    """API root endpoint."""
     return {
         "message": "Concurrent RAG System API",
         "version": "1.0.0",
@@ -306,7 +330,7 @@ async def api_status():
 # Authentication endpoints
 from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
 from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
-from ..shared.middleware import get_current_user, get_current_user_optional, rate_limiter, validate_token
+from ..shared.middleware import get_current_user, get_current_user_optional, rate_limiter, validate_token, require_permissions
 
 
 @app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
@@ -549,7 +573,7 @@ import shutil
 from pathlib import Path
 from fastapi import UploadFile, File, Form
 from typing import List
-from ..shared.job_manager import job_manager, JobType
+from ..shared.job_manager import job_manager, JobType, JobStatus
 from ..workers.celery_app import celery_app
 
 @app.post("/api/documents/upload", tags=["Documents"])
@@ -906,6 +930,522 @@ async def get_document_status(
     document_id: str,
     current_user: UserSession = Depends(get_current_user)
 ):
+    """
+    Get document processing status.
+    
+    Args:
+        document_id: Document identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Document processing status
+    
+    Raises:
+        HTTPException: If document not found or access denied
+    """
+    try:
+        # Search for document across user's groups
+        document = None
+        for group_id in current_user.groups:
+            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(doc_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        return {
+            "document_id": document_id,
+            "filename": document.filename,
+            "processing_status": document.processing_status,
+            "upload_date": document.upload_date.isoformat() + "Z" if document.upload_date else None,
+            "file_size": document.file_size,
+            "page_count": document.page_count,
+            "chunk_count": document.chunk_count
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document status service error"
+        )
+
+
+# Job management endpoints
+from ..shared.job_manager import job_manager, JobType, JobStatus
+
+@app.get("/api/jobs", tags=["Jobs"])
+async def list_jobs(
+    request: Request,
+    job_type: Optional[str] = None,
+    status: Optional[str] = None,
+    active_only: bool = False,
+    limit: int = 50,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's jobs with filtering.
+    
+    Args:
+        request: FastAPI request object
+        job_type: Optional job type filter (embedding, query)
+        status: Optional status filter
+        active_only: If True, only return non-finished jobs
+        limit: Maximum number of jobs to return
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of jobs with metadata
+    """
+    try:
+        # Parse job type filter
+        job_type_filter = None
+        if job_type:
+            try:
+                job_type_filter = JobType(job_type.lower())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid job type: {job_type}. Valid types: {[t.value for t in JobType]}"
+                )
+        
+        # Parse status filter
+        status_filter = None
+        if status:
+            try:
+                status_filter = JobStatus(status.lower())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid status: {status}. Valid statuses: {[s.value for s in JobStatus]}"
+                )
+        
+        # Get user jobs
+        jobs = job_manager.get_user_jobs(
+            user_id=current_user.user_id,
+            job_type=job_type_filter,
+            status=status_filter,
+            active_only=active_only,
+            limit=limit
+        )
+        
+        # Convert to dict format
+        job_list = []
+        for job in jobs:
+            job_dict = job.to_dict()
+            # Add estimated completion time for processing jobs
+            if job.status == JobStatus.PROCESSING and job.progress > 0:
+                try:
+                    elapsed = (datetime.now() - job.started_at).total_seconds()
+                    estimated_total = elapsed / job.progress
+                    remaining = estimated_total - elapsed
+                    if remaining > 0:
+                        completion_time = datetime.now().timestamp() + remaining
+                        job_dict["estimated_completion"] = datetime.fromtimestamp(completion_time).isoformat()
+                except Exception:
+                    pass  # Skip if calculation fails
+            
+            job_list.append(job_dict)
+        
+        return {
+            "jobs": job_list,
+            "total_count": len(job_list),
+            "filters": {
+                "job_type": job_type,
+                "status": status,
+                "active_only": active_only
+            }
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing jobs for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job listing service error"
+        )
+
+
+@app.get("/api/jobs/{job_id}", tags=["Jobs"])
+async def get_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get specific job details.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Job details
+    
+    Raises:
+        HTTPException: If job not found or access denied
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Verify job ownership
+        if job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to job"
+            )
+        
+        job_dict = job.to_dict()
+        
+        # Add additional computed fields
+        if job.status == JobStatus.PROCESSING and job.progress > 0:
+            try:
+                elapsed = (datetime.now() - job.started_at).total_seconds()
+                estimated_total = elapsed / job.progress
+                remaining = estimated_total - elapsed
+                if remaining > 0:
+                    completion_time = datetime.now().timestamp() + remaining
+                    job_dict["estimated_completion"] = datetime.fromtimestamp(completion_time).isoformat()
+            except Exception:
+                pass
+        
+        # Add duration for completed jobs
+        duration = job.get_duration()
+        if duration is not None:
+            job_dict["duration_seconds"] = duration
+        
+        return job_dict
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job {job_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job retrieval service error"
+        )
+
+
+@app.post("/api/jobs/{job_id}/cancel", tags=["Jobs"])
+async def cancel_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 cancellations per 5 minutes
+):
+    """
+    Cancel a job.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Cancellation confirmation
+    
+    Raises:
+        HTTPException: If job not found, access denied, or cancellation fails
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Verify job ownership
+        if job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to job"
+            )
+        
+        # Check if job can be cancelled
+        if job.status not in [JobStatus.PENDING, JobStatus.PROCESSING]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot cancel job with status: {job.status.value}"
+            )
+        
+        # Cancel the job
+        success = job_manager.cancel_job(job_id, reason="Cancelled by user")
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to cancel job"
+            )
+        
+        # Try to cancel the Celery task if it exists
+        celery_task_id = job.metadata.get("celery_task_id")
+        if celery_task_id:
+            try:
+                celery_app.control.revoke(celery_task_id, terminate=True)
+                logger.info(f"Revoked Celery task {celery_task_id} for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to revoke Celery task {celery_task_id}: {e}")
+        
+        logger.info(f"Cancelled job {job_id} for user {current_user.user_id}")
+        
+        return {
+            "message": "Job cancelled successfully",
+            "job_id": job_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling job {job_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job cancellation service error"
+        )
+
+
+@app.delete("/api/jobs/{job_id}", tags=["Jobs"])
+async def delete_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
+):
+    """
+    Delete a completed job.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Deletion confirmation
+    
+    Raises:
+        HTTPException: If job not found, access denied, or deletion fails
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Verify job ownership
+        if job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to job"
+            )
+        
+        # Check if job can be deleted (only finished jobs)
+        if not job.is_finished():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot delete active job with status: {job.status.value}"
+            )
+        
+        # Delete the job
+        success = job_manager.delete_job(job_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete job"
+            )
+        
+        logger.info(f"Deleted job {job_id} for user {current_user.user_id}")
+        
+        return {
+            "message": "Job deleted successfully",
+            "job_id": job_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting job {job_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job deletion service error"
+        )
+
+
+@app.get("/api/jobs/stats", tags=["Jobs"])
+async def get_job_statistics(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get job statistics for the current user.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Job statistics
+    """
+    try:
+        stats = job_manager.get_job_statistics(user_id=current_user.user_id)
+        
+        return {
+            "user_id": current_user.user_id,
+            "statistics": stats,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting job statistics for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job statistics service error"
+        )
+
+
+# WebSocket endpoints
+from fastapi import WebSocket, WebSocketDisconnect, Query
+from ..shared.websocket_manager import websocket_manager, WebSocketAuthenticationError, WebSocketConnectionError
+
+@app.websocket("/ws/updates")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(..., description="JWT authentication token")
+):
+    """
+    WebSocket endpoint for real-time updates.
+    
+    Args:
+        websocket: WebSocket connection
+        token: JWT authentication token
+    
+    This endpoint provides real-time updates for:
+    - Job status changes
+    - Document processing progress
+    - System notifications
+    - User-specific messages
+    """
+    connection = None
+    
+    try:
+        # Authenticate and establish connection
+        connection = await websocket_manager.connect(websocket, token)
+        
+        logger.info(f"WebSocket connection established for user {connection.user_session.user_id}")
+        
+        # Handle incoming messages
+        while True:
+            try:
+                # Receive message from client
+                message = await websocket.receive_text()
+                
+                # Handle the message
+                await websocket_manager.handle_message(connection.connection_id, message)
+                
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket client disconnected: {connection.connection_id}")
+                break
+            
+            except Exception as e:
+                logger.error(f"Error handling WebSocket message: {e}")
+                # Send error to client but continue connection
+                if connection:
+                    await connection.send_error("MESSAGE_ERROR", "Error processing message")
+    
+    except WebSocketAuthenticationError as e:
+        logger.warning(f"WebSocket authentication failed: {e}")
+        # Connection will be closed by the manager
+    
+    except WebSocketConnectionError as e:
+        logger.error(f"WebSocket connection error: {e}")
+    
+    except Exception as e:
+        logger.error(f"Unexpected WebSocket error: {e}")
+    
+    finally:
+        # Clean up connection
+        if connection:
+            await websocket_manager.disconnect(connection.connection_id)
+
+
+@app.get("/api/websocket/stats", tags=["WebSocket"])
+async def get_websocket_stats(
+    current_user: UserSession = Depends(require_permissions(["admin"]))
+):
+    """
+    Get WebSocket connection statistics (admin only).
+    
+    Args:
+        current_user: Current authenticated user (must have admin permission)
+    
+    Returns:
+        dict: WebSocket connection statistics
+    """
+    try:
+        stats = websocket_manager.get_connection_stats()
+        return {
+            "websocket_stats": stats,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting WebSocket stats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="WebSocket stats service error"
+        )
+
+
+@app.get("/api/websocket/health", tags=["WebSocket"])
+async def websocket_health_check():
+    """
+    WebSocket health check endpoint.
+    
+    Returns:
+        dict: WebSocket health status
+    """
+    try:
+        health = websocket_manager.health_check()
+        
+        status_code = 200 if health.get("websocket_manager", False) else 503
+        
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "websocket_health": health,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"WebSocket health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "HEALTH_CHECK_FAILED",
+                    "message": "WebSocket health check failed",
+                    "details": str(e)
+                },
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
     """
     Get document processing status and progress.
     

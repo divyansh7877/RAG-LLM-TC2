@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Concurrent RAG System</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">
+                    <i class="fas fa-brain"></i>
+                    RAG System
+                </h1>
+                <div class="user-info" id="userInfo" style="display: none;">
+                    <span id="userName"></span>
+                    <button id="logoutBtn" class="btn btn-secondary">
+                        <i class="fas fa-sign-out-alt"></i>
+                        Logout
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Login Form -->
+        <div id="loginForm" class="login-container">
+            <div class="login-card">
+                <h2>
+                    <i class="fas fa-lock"></i>
+                    Login
+                </h2>
+                <form id="loginFormElement">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" name="username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-sign-in-alt"></i>
+                        Login
+                    </button>
+                </form>
+                <div id="loginError" class="error-message" style="display: none;"></div>
+            </div>
+        </div>
+
+        <!-- Main Application -->
+        <div id="mainApp" class="main-app" style="display: none;">
+            <!-- Navigation Tabs -->
+            <nav class="nav-tabs">
+                <button class="nav-tab active" data-tab="upload">
+                    <i class="fas fa-upload"></i>
+                    Upload Documents
+                </button>
+                <button class="nav-tab" data-tab="query">
+                    <i class="fas fa-search"></i>
+                    Query Documents
+                </button>
+                <button class="nav-tab" data-tab="documents">
+                    <i class="fas fa-file-alt"></i>
+                    My Documents
+                </button>
+                <button class="nav-tab" data-tab="jobs">
+                    <i class="fas fa-tasks"></i>
+                    Job Status
+                </button>
+            </nav>
+
+            <!-- Tab Content -->
+            <div class="tab-content">
+                <!-- Upload Tab -->
+                <div id="uploadTab" class="tab-pane active">
+                    <div class="upload-section">
+                        <h3>Upload Documents</h3>
+                        
+                        <div class="form-group">
+                            <label for="groupSelect">Select Group</label>
+                            <select id="groupSelect" class="form-control">
+                                <option value="">Select a group...</option>
+                            </select>
+                        </div>
+
+                        <div class="upload-area" id="uploadArea">
+                            <div class="upload-content">
+                                <i class="fas fa-cloud-upload-alt upload-icon"></i>
+                                <p>Drag and drop PDF files here or click to browse</p>
+                                <input type="file" id="fileInput" multiple accept=".pdf" style="display: none;">
+                                <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                                    <i class="fas fa-folder-open"></i>
+                                    Browse Files
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="fileList" class="file-list" style="display: none;">
+                            <h4>Selected Files</h4>
+                            <div id="selectedFiles"></div>
+                            <button id="uploadBtn" class="btn btn-success">
+                                <i class="fas fa-upload"></i>
+                                Upload Files
+                            </button>
+                        </div>
+
+                        <div id="uploadProgress" class="upload-progress" style="display: none;">
+                            <h4>Upload Progress</h4>
+                            <div class="progress-bar">
+                                <div id="progressFill" class="progress-fill"></div>
+                            </div>
+                            <div id="progressText" class="progress-text">0%</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Query Tab -->
+                <div id="queryTab" class="tab-pane">
+                    <div class="query-section">
+                        <h3>Query Documents</h3>
+                        
+                        <div class="query-form">
+                            <div class="form-group">
+                                <label for="queryInput">Enter your question</label>
+                                <textarea id="queryInput" class="form-control" rows="3" 
+                                    placeholder="Ask a question about your documents..."></textarea>
+                            </div>
+                            <button id="submitQueryBtn" class="btn btn-primary">
+                                <i class="fas fa-search"></i>
+                                Submit Query
+                            </button>
+                        </div>
+
+                        <div id="queryResults" class="query-results" style="display: none;">
+                            <h4>Query Results</h4>
+                            <div id="queryResponse" class="query-response"></div>
+                            <div id="queryStatus" class="query-status"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Documents Tab -->
+                <div id="documentsTab" class="tab-pane">
+                    <div class="documents-section">
+                        <h3>My Documents</h3>
+                        
+                        <div class="documents-filters">
+                            <div class="filter-group">
+                                <label for="groupFilter">Filter by Group</label>
+                                <select id="groupFilter" class="form-control">
+                                    <option value="">All Groups</option>
+                                </select>
+                            </div>
+                            <div class="filter-group">
+                                <label for="statusFilter">Filter by Status</label>
+                                <select id="statusFilter" class="form-control">
+                                    <option value="">All Status</option>
+                                    <option value="processing">Processing</option>
+                                    <option value="completed">Completed</option>
+                                    <option value="failed">Failed</option>
+                                </select>
+                            </div>
+                            <button id="refreshDocuments" class="btn btn-secondary">
+                                <i class="fas fa-sync-alt"></i>
+                                Refresh
+                            </button>
+                        </div>
+
+                        <div id="documentsGrid" class="documents-grid">
+                            <!-- Documents will be loaded here -->
+                        </div>
+
+                        <div id="documentsLoading" class="loading" style="display: none;">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            Loading documents...
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Jobs Tab -->
+                <div id="jobsTab" class="tab-pane">
+                    <div class="jobs-section">
+                        <h3>Job Status Dashboard</h3>
+                        
+                        <div class="jobs-summary">
+                            <div class="job-stat">
+                                <div class="stat-value" id="activeJobs">0</div>
+                                <div class="stat-label">Active Jobs</div>
+                            </div>
+                            <div class="job-stat">
+                                <div class="stat-value" id="completedJobs">0</div>
+                                <div class="stat-label">Completed</div>
+                            </div>
+                            <div class="job-stat">
+                                <div class="stat-value" id="failedJobs">0</div>
+                                <div class="stat-label">Failed</div>
+                            </div>
+                        </div>
+
+                        <div id="jobsList" class="jobs-list">
+                            <!-- Jobs will be loaded here -->
+                        </div>
+
+                        <div id="jobsLoading" class="loading" style="display: none;">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            Loading jobs...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Connection Status -->
+        <div id="connectionStatus" class="connection-status">
+            <i class="fas fa-wifi"></i>
+            <span id="connectionText">Connected</span>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div id="toastContainer" class="toast-container"></div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

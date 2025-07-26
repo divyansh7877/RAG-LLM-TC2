@@ -98,37 +98,37 @@
     - Write tests for query processing and response handling
     - _Requirements: 1.1, 1.4, 2.1, 2.2, 3.1_
 
-- [ ] 7. Add real-time communication with WebSockets
-  - [ ] 7.1 Implement WebSocket connection management
+- [x] 7. Add real-time communication with WebSockets
+  - [x] 7.1 Implement WebSocket connection management
     - Create WebSocket endpoint for real-time updates
     - Implement connection authentication and user association
     - Add connection cleanup and error handling
     - _Requirements: 3.1, 3.2, 3.4_
 
-  - [ ] 7.2 Create real-time job status broadcasting
+  - [x] 7.2 Create real-time job status broadcasting
     - Implement job status change notifications via WebSocket
     - Add progress updates for long-running operations
     - Create user-specific notification filtering
     - Write tests for real-time notification delivery
     - _Requirements: 3.1, 3.2, 3.4, 6.2_
 
-- [ ] 8. Build modern frontend interface
-  - [ ] 8.1 Create responsive HTML/CSS/JavaScript frontend
+- [x] 8. Build modern frontend interface
+  - [x] 8.1 Create responsive HTML/CSS/JavaScript frontend
     - Build modern, responsive UI with real-time status updates
     - Implement file upload with drag-and-drop and progress bars
     - Add query interface with real-time response streaming
     - Create job management dashboard with status monitoring
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
-  - [ ] 8.2 Implement frontend WebSocket integration
+  - [x] 8.2 Implement frontend WebSocket integration
     - Connect frontend to WebSocket endpoint for real-time updates
     - Add automatic reconnection and error handling
     - Implement real-time job status updates in the UI
     - Write frontend tests for WebSocket functionality
     - _Requirements: 3.1, 3.2, 3.4_
 
-- [ ] 9. Enhance query engine with thread safety
-  - [ ] 9.1 Refactor query engine for concurrent access
+- [-] 9. Enhance query engine with thread safety
+  - [x] 9.1 Refactor query engine for concurrent access
     - Modify QueryEngineFactory to be fully thread-safe
     - Implement connection pooling for database access
     - Add query result caching with user isolation
