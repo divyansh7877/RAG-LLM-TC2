@@ -28,6 +28,10 @@ CACHE_EXPIRE_SECONDS = 3600  # 1 hour cache expiration
 SIMILARITY_THRESHOLD = 0.7
 MAX_RETRIEVED_NODES = 10
 
+# Performance monitoring constants
+PERFORMANCE_METRICS_KEY = "performance:query_metrics"
+SLOW_QUERY_THRESHOLD = 5.0  # seconds
+
 
 class QuerySecurityError(Exception):
     """Exception raised for query security violations."""
@@ -137,6 +141,178 @@ def update_query_progress(query_id: str, progress: float, status_message: str = 
         logger.error(f"Failed to update query progress: {e}")
 
 
+def record_query_performance_metrics(query_id: str, user_id: str, query_text: str, 
+                                   processing_time: float, result_count: int, 
+                                   cached: bool, error: Optional[str] = None):
+    """
+    Record query performance metrics for monitoring and optimization.
+    
+    Args:
+        query_id: Query identifier
+        user_id: User who submitted the query
+        query_text: The query text
+        processing_time: Time taken to process the query
+        result_count: Number of results returned
+        cached: Whether result was served from cache
+        error: Error message if query failed
+    """
+    try:
+        timestamp = time.time()
+        
+        # Create performance metrics entry
+        metrics = {
+            "query_id": query_id,
+            "user_id": user_id,
+            "query_length": len(query_text),
+            "processing_time": processing_time,
+            "result_count": result_count,
+            "cached": cached,
+            "timestamp": timestamp,
+            "date": time.strftime("%Y-%m-%d", time.localtime(timestamp)),
+            "hour": time.strftime("%H", time.localtime(timestamp)),
+            "success": error is None,
+            "error": error,
+            "slow_query": processing_time > SLOW_QUERY_THRESHOLD
+        }
+        
+        # Store individual metric
+        metric_key = f"{PERFORMANCE_METRICS_KEY}:{query_id}"
+        redis_client.set_json(metric_key, metrics, expire_seconds=86400 * 7)  # Keep for 7 days
+        
+        # Update aggregated metrics
+        _update_aggregated_metrics(metrics)
+        
+        # Log slow queries for investigation
+        if processing_time > SLOW_QUERY_THRESHOLD:
+            logger.warning(f"Slow query detected: {query_id} took {processing_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"Failed to record performance metrics for query {query_id}: {e}")
+
+
+def _update_aggregated_metrics(metrics: Dict[str, Any]):
+    """Update aggregated performance metrics for dashboard and monitoring."""
+    try:
+        date_key = f"{PERFORMANCE_METRICS_KEY}:daily:{metrics['date']}"
+        hour_key = f"{PERFORMANCE_METRICS_KEY}:hourly:{metrics['date']}:{metrics['hour']}"
+        
+        # Update daily aggregates
+        daily_stats = redis_client.get_json(date_key) or {
+            "date": metrics["date"],
+            "total_queries": 0,
+            "successful_queries": 0,
+            "cached_queries": 0,
+            "slow_queries": 0,
+            "total_processing_time": 0.0,
+            "avg_processing_time": 0.0,
+            "avg_result_count": 0.0,
+            "total_result_count": 0
+        }
+        
+        daily_stats["total_queries"] += 1
+        if metrics["success"]:
+            daily_stats["successful_queries"] += 1
+        if metrics["cached"]:
+            daily_stats["cached_queries"] += 1
+        if metrics["slow_query"]:
+            daily_stats["slow_queries"] += 1
+        
+        daily_stats["total_processing_time"] += metrics["processing_time"]
+        daily_stats["avg_processing_time"] = daily_stats["total_processing_time"] / daily_stats["total_queries"]
+        
+        daily_stats["total_result_count"] += metrics["result_count"]
+        daily_stats["avg_result_count"] = daily_stats["total_result_count"] / daily_stats["total_queries"]
+        
+        redis_client.set_json(date_key, daily_stats, expire_seconds=86400 * 30)  # Keep for 30 days
+        
+        # Update hourly aggregates (similar structure)
+        hourly_stats = redis_client.get_json(hour_key) or {
+            "date": metrics["date"],
+            "hour": metrics["hour"],
+            "total_queries": 0,
+            "successful_queries": 0,
+            "cached_queries": 0,
+            "slow_queries": 0,
+            "avg_processing_time": 0.0,
+            "total_processing_time": 0.0
+        }
+        
+        hourly_stats["total_queries"] += 1
+        if metrics["success"]:
+            hourly_stats["successful_queries"] += 1
+        if metrics["cached"]:
+            hourly_stats["cached_queries"] += 1
+        if metrics["slow_query"]:
+            hourly_stats["slow_queries"] += 1
+        
+        hourly_stats["total_processing_time"] += metrics["processing_time"]
+        hourly_stats["avg_processing_time"] = hourly_stats["total_processing_time"] / hourly_stats["total_queries"]
+        
+        redis_client.set_json(hour_key, hourly_stats, expire_seconds=86400 * 7)  # Keep for 7 days
+        
+    except Exception as e:
+        logger.error(f"Failed to update aggregated metrics: {e}")
+
+
+def get_query_performance_stats(days: int = 7) -> Dict[str, Any]:
+    """
+    Get query performance statistics for the specified number of days.
+    
+    Args:
+        days: Number of days to retrieve statistics for
+        
+    Returns:
+        Dictionary containing performance statistics
+    """
+    try:
+        stats = {
+            "period_days": days,
+            "daily_stats": [],
+            "summary": {
+                "total_queries": 0,
+                "successful_queries": 0,
+                "cached_queries": 0,
+                "slow_queries": 0,
+                "avg_processing_time": 0.0,
+                "cache_hit_rate": 0.0,
+                "success_rate": 0.0,
+                "slow_query_rate": 0.0
+            }
+        }
+        
+        total_processing_time = 0.0
+        
+        # Get daily stats for the specified period
+        for i in range(days):
+            date = time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
+            date_key = f"{PERFORMANCE_METRICS_KEY}:daily:{date}"
+            
+            daily_data = redis_client.get_json(date_key)
+            if daily_data:
+                stats["daily_stats"].append(daily_data)
+                
+                # Update summary
+                stats["summary"]["total_queries"] += daily_data["total_queries"]
+                stats["summary"]["successful_queries"] += daily_data["successful_queries"]
+                stats["summary"]["cached_queries"] += daily_data["cached_queries"]
+                stats["summary"]["slow_queries"] += daily_data["slow_queries"]
+                total_processing_time += daily_data["total_processing_time"]
+        
+        # Calculate summary rates
+        total_queries = stats["summary"]["total_queries"]
+        if total_queries > 0:
+            stats["summary"]["avg_processing_time"] = total_processing_time / total_queries
+            stats["summary"]["cache_hit_rate"] = stats["summary"]["cached_queries"] / total_queries
+            stats["summary"]["success_rate"] = stats["summary"]["successful_queries"] / total_queries
+            stats["summary"]["slow_query_rate"] = stats["summary"]["slow_queries"] / total_queries
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Failed to get query performance stats: {e}")
+        return {"error": str(e)}
+
+
 @celery_app.task(bind=True, name="process_user_query", 
                 autoretry_for=(ConnectionError, TimeoutError), 
                 retry_kwargs={'max_retries': 2, 'countdown': 30})
@@ -179,6 +355,12 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             cached_result["processing_time"] = processing_time
             cached_result["cached"] = True
             
+            # Record performance metrics for cached result
+            record_query_performance_metrics(
+                query_id, user_id, query_text, processing_time,
+                cached_result.get("result_count", 0), True
+            )
+            
             # Update job status to completed (this will trigger WebSocket notification)
             job_manager.update_job_status(query_id, JobStatus.COMPLETED, result=cached_result)
             
@@ -216,6 +398,12 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         # Cache the result for future queries using the factory cache
         query_engine_factory.cache_query_result(user_id, group_ids, query_text, result)
         
+        # Record performance metrics for non-cached result
+        record_query_performance_metrics(
+            query_id, user_id, query_text, processing_time,
+            len(sources), False
+        )
+        
         # Update job status to completed (this will trigger WebSocket notification)
         job_manager.update_job_status(query_id, JobStatus.COMPLETED, result=result)
         
@@ -240,6 +428,12 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         if isinstance(e, (ConnectionError, TimeoutError)) and self.request.retries < 2:
             logger.info(f"Retrying query {query_id} due to {type(e).__name__}")
             raise self.retry(countdown=30, exc=e)
+        
+        # Record performance metrics for failed query
+        processing_time = time.time() - start_time
+        record_query_performance_metrics(
+            query_id, user_id, query_text, processing_time, 0, False, error_message
+        )
         
         # Update job status to failed (this will trigger WebSocket notification)
         job_manager.update_job_status(query_id, JobStatus.FAILED, error=error_message)

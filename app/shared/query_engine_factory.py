@@ -506,18 +506,24 @@ class ThreadSafeQueryEngineFactory:
             # Get the shared index
             index = self._get_or_create_index()
             
-            # Create a new retriever instance (not shared between threads)
+            # Create a new retriever instance with optimized parameters
             retriever = VectorIndexRetriever(
                 index=index,
-                similarity_top_k=30,  # Initial beam for MMR
-                filters=user_filters
+                similarity_top_k=50,  # Increased for better recall before reranking
+                filters=user_filters,
+                # Add vector search optimization parameters
+                vector_store_query_mode="default",
+                alpha=None,  # Use default hybrid search alpha
+                doc_ids=None,
+                similarity_cutoff=0.7,  # Filter out low-similarity results
             )
             
-            # Create reranker for better results
+            # Create reranker with optimized parameters for better results
             reranker = SentenceTransformerRerank(
                 model="cross-encoder/ms-marco-MiniLM-L-6-v2",
-                top_n=8,  # Final number of chunks
+                top_n=12,  # Increased final number of chunks for better context
                 device="cpu",
+                keep_retrieval_score=True,  # Keep original scores for analysis
             )
             
             # Create response synthesizer

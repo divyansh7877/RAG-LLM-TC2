@@ -327,6 +327,192 @@ async def api_status():
         )
 
 
+# Performance monitoring endpoints
+@app.get("/api/performance/query", tags=["Performance"])
+async def get_query_performance_metrics(
+    days: int = 7,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get query performance metrics and statistics.
+    
+    Args:
+        days: Number of days to retrieve statistics for (default: 7)
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Query performance statistics
+    """
+    try:
+        from ..workers.query_worker import get_query_performance_stats
+        
+        # Validate days parameter
+        if days < 1 or days > 30:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Days parameter must be between 1 and 30"
+            )
+        
+        stats = get_query_performance_stats(days=days)
+        
+        return {
+            "query_performance": stats,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting query performance metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Performance metrics service error"
+        )
+
+
+@app.get("/api/performance/embedding", tags=["Performance"])
+async def get_embedding_performance_metrics(
+    days: int = 7,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get embedding performance metrics and statistics.
+    
+    Args:
+        days: Number of days to retrieve statistics for (default: 7)
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Embedding performance statistics
+    """
+    try:
+        from ..workers.embedding_worker import get_embedding_performance_stats
+        
+        # Validate days parameter
+        if days < 1 or days > 30:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Days parameter must be between 1 and 30"
+            )
+        
+        stats = get_embedding_performance_stats(days=days)
+        
+        return {
+            "embedding_performance": stats,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding performance metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Performance metrics service error"
+        )
+
+
+@app.get("/api/performance/system", tags=["Performance"])
+async def get_system_performance_metrics(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get overall system performance metrics.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: System performance metrics
+    """
+    try:
+        from ..shared.resource_manager import resource_manager
+        from ..shared.query_engine_factory import query_engine_factory
+        
+        # Get resource manager health status
+        resource_health = resource_manager.get_health_status()
+        
+        # Get query engine factory stats
+        factory_stats = query_engine_factory.get_factory_stats()
+        
+        # Get current metrics
+        current_metrics = resource_manager.get_current_metrics()
+        
+        system_performance = {
+            "resource_health": resource_health,
+            "query_engine_stats": factory_stats,
+            "current_metrics": {
+                "memory_usage": f"{current_metrics.memory_usage:.1f}%" if current_metrics else "unknown",
+                "cpu_usage": f"{current_metrics.cpu_usage:.1f}%" if current_metrics else "unknown",
+                "disk_usage": f"{current_metrics.disk_usage:.1f}%" if current_metrics else "unknown",
+                "active_workers": current_metrics.active_workers if current_metrics else 0,
+                "active_tasks": current_metrics.active_tasks if current_metrics else 0,
+                "queue_lengths": current_metrics.queue_lengths if current_metrics else {}
+            } if current_metrics else {
+                "memory_usage": "unknown",
+                "cpu_usage": "unknown", 
+                "disk_usage": "unknown",
+                "active_workers": 0,
+                "active_tasks": 0,
+                "queue_lengths": {}
+            }
+        }
+        
+        return {
+            "system_performance": system_performance,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting system performance metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="System performance metrics service error"
+        )
+
+
+@app.get("/api/performance/cache", tags=["Performance"])
+async def get_cache_performance_metrics(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get cache performance metrics and statistics.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Cache performance metrics
+    """
+    try:
+        from ..shared.query_engine_factory import query_engine_factory
+        
+        # Get factory stats which include cache information
+        factory_stats = query_engine_factory.get_factory_stats()
+        
+        cache_performance = {
+            "query_cache": factory_stats.get("query_cache", {}),
+            "connection_pool": factory_stats.get("connection_pool", {}),
+            "factory_health": query_engine_factory.health_check()
+        }
+        
+        return {
+            "cache_performance": cache_performance,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting cache performance metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Cache performance metrics service error"
+        )
+
+
 # Authentication endpoints
 from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
 from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError

@@ -38,6 +38,10 @@ EMBED_MODEL_NAME = "./models/gte-large-en-v1.5"
 DB_PATH = "./multi_user_db.lance"
 TABLE_NAME = "document_embeddings"
 
+# Performance monitoring constants
+EMBEDDING_METRICS_KEY = "performance:embedding_metrics"
+SLOW_EMBEDDING_THRESHOLD = 30.0  # seconds per file
+
 
 def extract_pages_from_pdf(pdf_path: str) -> List[Tuple[str, int]]:
     """Extract text from PDF pages with error handling."""
@@ -134,6 +138,126 @@ def create_nodes_from_pdf(pdf_path: str, user_id: str, group_id: str) -> List:
     return nodes
 
 
+def create_nodes_from_pdfs_batch(file_paths: List[str], user_id: str, group_id: str, 
+                                batch_size: int = 5) -> Tuple[List, List[Dict], List[Dict]]:
+    """
+    Create LlamaIndex nodes from multiple PDFs in batches for optimized processing.
+    
+    Args:
+        file_paths: List of PDF file paths to process
+        user_id: User identifier for metadata
+        group_id: Group identifier for metadata
+        batch_size: Number of files to process in each batch
+        
+    Returns:
+        Tuple of (all_nodes, processed_files, failed_files)
+    """
+    all_nodes = []
+    processed_files = []
+    failed_files = []
+    
+    # Process files in batches to optimize memory usage
+    for i in range(0, len(file_paths), batch_size):
+        batch_files = file_paths[i:i + batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}: {len(batch_files)} files")
+        
+        batch_nodes = []
+        batch_documents = []
+        
+        # First pass: extract text from all files in batch
+        for file_path in batch_files:
+            try:
+                filename = os.path.basename(file_path)
+                
+                # Check for duplicates
+                file_hash = calculate_file_hash(file_path)
+                if check_duplicate_document(user_id, group_id, file_hash):
+                    logger.info(f"Skipping duplicate file: {filename}")
+                    processed_files.append({
+                        "filename": filename,
+                        "status": "skipped",
+                        "reason": "duplicate"
+                    })
+                    continue
+                
+                # Extract pages and create documents
+                pages = extract_pages_from_pdf(file_path)
+                file_size = os.path.getsize(file_path)
+                
+                for text, page_number in pages:
+                    cleaned_text = clean_text(text)
+                    if not cleaned_text:  # Skip empty pages
+                        continue
+                        
+                    metadata = {
+                        "document_name": filename,
+                        "page_number": page_number,
+                        "user_id": user_id,
+                        "group_id": group_id,
+                        "file_size": file_size,
+                        "file_hash": file_hash,
+                        "upload_date": time.time(),
+                        "content_type": "application/pdf"
+                    }
+                    
+                    batch_documents.append(
+                        LlamaDocument(
+                            text=cleaned_text,
+                            metadata=metadata,
+                            id_=f"{user_id}_{group_id}_{filename}_p{page_number}",
+                        )
+                    )
+                
+                processed_files.append({
+                    "filename": filename,
+                    "status": "processed",
+                    "page_count": len(pages),
+                    "file_hash": file_hash
+                })
+                
+                logger.debug(f"Extracted text from {filename}: {len(pages)} pages")
+                
+            except Exception as e:
+                logger.error(f"Failed to process file {file_path}: {e}")
+                failed_files.append({
+                    "filename": os.path.basename(file_path),
+                    "error": str(e)
+                })
+        
+        # Second pass: batch process documents into chunks
+        if batch_documents:
+            try:
+                # Use batch processing for chunking - more efficient than individual processing
+                splitter = SentenceSplitter(
+                    chunk_size=CHUNK_SIZE,
+                    chunk_overlap=CHUNK_OVERLAP,
+                    include_metadata=True,
+                )
+                
+                batch_nodes = splitter.get_nodes_from_documents(batch_documents)
+                all_nodes.extend(batch_nodes)
+                
+                logger.info(f"Batch {i//batch_size + 1}: Created {len(batch_nodes)} nodes from {len(batch_documents)} documents")
+                
+            except Exception as e:
+                logger.error(f"Failed to create nodes for batch {i//batch_size + 1}: {e}")
+                # Mark all files in this batch as failed
+                for file_path in batch_files:
+                    filename = os.path.basename(file_path)
+                    if not any(f["filename"] == filename for f in failed_files):
+                        failed_files.append({
+                            "filename": filename,
+                            "error": f"Batch processing failed: {e}"
+                        })
+        
+        # Clear batch data to free memory
+        batch_documents.clear()
+        batch_nodes.clear()
+    
+    logger.info(f"Batch processing completed: {len(all_nodes)} total nodes from {len(processed_files)} files")
+    return all_nodes, processed_files, failed_files
+
+
 def check_duplicate_document(user_id: str, group_id: str, file_hash: str) -> bool:
     """Check if document with same hash already exists for user/group."""
     try:
@@ -203,6 +327,191 @@ def update_job_progress(job_id: str, progress: float, status_message: str = None
         logger.error(f"Failed to update job progress: {e}")
 
 
+def record_embedding_performance_metrics(job_id: str, user_id: str, file_count: int,
+                                       total_processing_time: float, total_chunks: int,
+                                       batch_size: int, success: bool, error: str = None):
+    """
+    Record embedding performance metrics for monitoring and optimization.
+    
+    Args:
+        job_id: Job identifier
+        user_id: User who submitted the job
+        file_count: Number of files processed
+        total_processing_time: Total time taken to process all files
+        total_chunks: Total number of chunks created
+        batch_size: Batch size used for processing
+        success: Whether the job completed successfully
+        error: Error message if job failed
+    """
+    try:
+        timestamp = time.time()
+        avg_time_per_file = total_processing_time / max(file_count, 1)
+        
+        # Create performance metrics entry
+        metrics = {
+            "job_id": job_id,
+            "user_id": user_id,
+            "file_count": file_count,
+            "total_processing_time": total_processing_time,
+            "avg_time_per_file": avg_time_per_file,
+            "total_chunks": total_chunks,
+            "avg_chunks_per_file": total_chunks / max(file_count, 1),
+            "batch_size": batch_size,
+            "timestamp": timestamp,
+            "date": time.strftime("%Y-%m-%d", time.localtime(timestamp)),
+            "hour": time.strftime("%H", time.localtime(timestamp)),
+            "success": success,
+            "error": error,
+            "slow_processing": avg_time_per_file > SLOW_EMBEDDING_THRESHOLD
+        }
+        
+        # Store individual metric
+        metric_key = f"{EMBEDDING_METRICS_KEY}:{job_id}"
+        redis_client.set_json(metric_key, metrics, expire_seconds=86400 * 7)  # Keep for 7 days
+        
+        # Update aggregated metrics
+        _update_embedding_aggregated_metrics(metrics)
+        
+        # Log slow processing for investigation
+        if avg_time_per_file > SLOW_EMBEDDING_THRESHOLD:
+            logger.warning(f"Slow embedding detected: {job_id} took {avg_time_per_file:.2f}s per file")
+        
+    except Exception as e:
+        logger.error(f"Failed to record embedding performance metrics for job {job_id}: {e}")
+
+
+def _update_embedding_aggregated_metrics(metrics: Dict[str, Any]):
+    """Update aggregated embedding performance metrics for dashboard and monitoring."""
+    try:
+        date_key = f"{EMBEDDING_METRICS_KEY}:daily:{metrics['date']}"
+        hour_key = f"{EMBEDDING_METRICS_KEY}:hourly:{metrics['date']}:{metrics['hour']}"
+        
+        # Update daily aggregates
+        daily_stats = redis_client.get_json(date_key) or {
+            "date": metrics["date"],
+            "total_jobs": 0,
+            "successful_jobs": 0,
+            "slow_jobs": 0,
+            "total_files": 0,
+            "total_chunks": 0,
+            "total_processing_time": 0.0,
+            "avg_processing_time": 0.0,
+            "avg_time_per_file": 0.0,
+            "avg_chunks_per_file": 0.0
+        }
+        
+        daily_stats["total_jobs"] += 1
+        if metrics["success"]:
+            daily_stats["successful_jobs"] += 1
+        if metrics["slow_processing"]:
+            daily_stats["slow_jobs"] += 1
+        
+        daily_stats["total_files"] += metrics["file_count"]
+        daily_stats["total_chunks"] += metrics["total_chunks"]
+        daily_stats["total_processing_time"] += metrics["total_processing_time"]
+        
+        # Calculate averages
+        daily_stats["avg_processing_time"] = daily_stats["total_processing_time"] / daily_stats["total_jobs"]
+        daily_stats["avg_time_per_file"] = daily_stats["total_processing_time"] / max(daily_stats["total_files"], 1)
+        daily_stats["avg_chunks_per_file"] = daily_stats["total_chunks"] / max(daily_stats["total_files"], 1)
+        
+        redis_client.set_json(date_key, daily_stats, expire_seconds=86400 * 30)  # Keep for 30 days
+        
+        # Update hourly aggregates (similar structure)
+        hourly_stats = redis_client.get_json(hour_key) or {
+            "date": metrics["date"],
+            "hour": metrics["hour"],
+            "total_jobs": 0,
+            "successful_jobs": 0,
+            "slow_jobs": 0,
+            "total_files": 0,
+            "avg_time_per_file": 0.0,
+            "total_processing_time": 0.0
+        }
+        
+        hourly_stats["total_jobs"] += 1
+        if metrics["success"]:
+            hourly_stats["successful_jobs"] += 1
+        if metrics["slow_processing"]:
+            hourly_stats["slow_jobs"] += 1
+        
+        hourly_stats["total_files"] += metrics["file_count"]
+        hourly_stats["total_processing_time"] += metrics["total_processing_time"]
+        hourly_stats["avg_time_per_file"] = hourly_stats["total_processing_time"] / max(hourly_stats["total_files"], 1)
+        
+        redis_client.set_json(hour_key, hourly_stats, expire_seconds=86400 * 7)  # Keep for 7 days
+        
+    except Exception as e:
+        logger.error(f"Failed to update embedding aggregated metrics: {e}")
+
+
+def get_embedding_performance_stats(days: int = 7) -> Dict[str, Any]:
+    """
+    Get embedding performance statistics for the specified number of days.
+    
+    Args:
+        days: Number of days to retrieve statistics for
+        
+    Returns:
+        Dictionary containing performance statistics
+    """
+    try:
+        stats = {
+            "period_days": days,
+            "daily_stats": [],
+            "summary": {
+                "total_jobs": 0,
+                "successful_jobs": 0,
+                "slow_jobs": 0,
+                "total_files": 0,
+                "total_chunks": 0,
+                "avg_processing_time": 0.0,
+                "avg_time_per_file": 0.0,
+                "avg_chunks_per_file": 0.0,
+                "success_rate": 0.0,
+                "slow_job_rate": 0.0
+            }
+        }
+        
+        total_processing_time = 0.0
+        
+        # Get daily stats for the specified period
+        for i in range(days):
+            date = time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
+            date_key = f"{EMBEDDING_METRICS_KEY}:daily:{date}"
+            
+            daily_data = redis_client.get_json(date_key)
+            if daily_data:
+                stats["daily_stats"].append(daily_data)
+                
+                # Update summary
+                stats["summary"]["total_jobs"] += daily_data["total_jobs"]
+                stats["summary"]["successful_jobs"] += daily_data["successful_jobs"]
+                stats["summary"]["slow_jobs"] += daily_data["slow_jobs"]
+                stats["summary"]["total_files"] += daily_data["total_files"]
+                stats["summary"]["total_chunks"] += daily_data["total_chunks"]
+                total_processing_time += daily_data["total_processing_time"]
+        
+        # Calculate summary rates
+        total_jobs = stats["summary"]["total_jobs"]
+        total_files = stats["summary"]["total_files"]
+        
+        if total_jobs > 0:
+            stats["summary"]["avg_processing_time"] = total_processing_time / total_jobs
+            stats["summary"]["success_rate"] = stats["summary"]["successful_jobs"] / total_jobs
+            stats["summary"]["slow_job_rate"] = stats["summary"]["slow_jobs"] / total_jobs
+        
+        if total_files > 0:
+            stats["summary"]["avg_time_per_file"] = total_processing_time / total_files
+            stats["summary"]["avg_chunks_per_file"] = stats["summary"]["total_chunks"] / total_files
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Failed to get embedding performance stats: {e}")
+        return {"error": str(e)}
+
+
 @celery_app.task(bind=True, name="process_document_embedding", 
                 autoretry_for=(Exception,), retry_kwargs={'max_retries': 3, 'countdown': 60})
 def process_document_embedding(self, job_id: str, user_id: str, group_id: str, file_paths: List[str]):
@@ -225,6 +534,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
     temp_dir = None
     processed_files = []
     failed_files = []
+    start_time = time.time()  # Track start time for performance metrics
     
     try:
         # Validate inputs
@@ -251,63 +561,59 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         vector_store = LanceDBVectorStore(uri=DB_PATH, table_name=TABLE_NAME)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
         
-        # Process each file
+        # Validate all files exist and are readable
         total_files = len(file_paths)
-        all_nodes = []
+        for file_path in file_paths:
+            if not os.path.exists(file_path):
+                raise ValueError(f"File not found: {file_path}")
+            if not os.access(file_path, os.R_OK):
+                raise ValueError(f"File not readable: {file_path}")
         
-        for i, file_path in enumerate(file_paths):
-            try:
-                # Validate file exists and is readable
-                if not os.path.exists(file_path):
-                    raise ValueError(f"File not found: {file_path}")
-                
-                if not os.access(file_path, os.R_OK):
-                    raise ValueError(f"File not readable: {file_path}")
-                
-                filename = os.path.basename(file_path)
-                update_job_progress(job_id, i / total_files, f"Processing {filename}...")
-                
-                # Check for duplicates
-                file_hash = calculate_file_hash(file_path)
-                if check_duplicate_document(user_id, group_id, file_hash):
-                    logger.info(f"Skipping duplicate file: {filename}")
-                    processed_files.append({
-                        "filename": filename,
-                        "status": "skipped",
-                        "reason": "duplicate"
+        update_job_progress(job_id, 0.1, "Starting batch processing...")
+        
+        # Use batch processing for better performance
+        batch_size = min(5, max(1, total_files // 2))  # Adaptive batch size
+        all_nodes, processed_files, failed_files = create_nodes_from_pdfs_batch(
+            file_paths, user_id, group_id, batch_size
+        )
+        
+        # Store document metadata for successfully processed files
+        for file_info in processed_files:
+            if file_info["status"] == "processed":
+                try:
+                    # Find the original file path
+                    original_path = next(
+                        path for path in file_paths 
+                        if os.path.basename(path) == file_info["filename"]
+                    )
+                    
+                    # Count chunks for this specific file
+                    file_chunks = [
+                        node for node in all_nodes 
+                        if node.metadata.get("document_name") == file_info["filename"]
+                    ]
+                    
+                    document_id = store_document_metadata(
+                        user_id, group_id, original_path, 
+                        file_info["page_count"], len(file_chunks)
+                    )
+                    
+                    file_info["document_id"] = document_id
+                    file_info["chunk_count"] = len(file_chunks)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to store metadata for {file_info['filename']}: {e}")
+                    # Move to failed files
+                    failed_files.append({
+                        "filename": file_info["filename"],
+                        "error": f"Metadata storage failed: {e}"
                     })
-                    continue
-                
-                # Create nodes from PDF
-                nodes = create_nodes_from_pdf(file_path, user_id, group_id)
-                all_nodes.extend(nodes)
-                
-                # Store document metadata
-                page_count = len(extract_pages_from_pdf(file_path))
-                chunk_count = len(nodes)
-                document_id = store_document_metadata(
-                    user_id, group_id, file_path, page_count, chunk_count
-                )
-                
-                processed_files.append({
-                    "filename": filename,
-                    "document_id": document_id,
-                    "status": "processed",
-                    "page_count": page_count,
-                    "chunk_count": chunk_count
-                })
-                
-                logger.info(f"Successfully processed {filename}: {page_count} pages, {chunk_count} chunks")
-                
-            except Exception as e:
-                logger.error(f"Failed to process file {file_path}: {e}")
-                failed_files.append({
-                    "filename": os.path.basename(file_path),
-                    "error": str(e)
-                })
-                
-                # Continue processing other files
-                continue
+        
+        # Remove files that failed metadata storage from processed_files
+        processed_files = [
+            f for f in processed_files 
+            if f["status"] != "processed" or "document_id" in f
+        ]
         
         # Update progress for embedding phase
         update_job_progress(job_id, 0.8, "Creating vector embeddings...")
@@ -348,6 +654,13 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
             "message": f"Successfully processed {len(processed_files)} of {total_files} files"
         }
         
+        # Record performance metrics
+        total_processing_time = time.time() - start_time
+        record_embedding_performance_metrics(
+            job_id, user_id, total_files, total_processing_time,
+            len(all_nodes), batch_size, True
+        )
+        
         # Update job status to completed (this will trigger WebSocket notification)
         job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
         
@@ -361,6 +674,14 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         if isinstance(e, (ConnectionError, TimeoutError)) and self.request.retries < 3:
             logger.info(f"Retrying job {job_id} due to {type(e).__name__}")
             raise self.retry(countdown=60, exc=e)
+        
+        # Record performance metrics for failed job
+        total_processing_time = time.time() - start_time
+        file_count = len(file_paths) if file_paths else 0
+        record_embedding_performance_metrics(
+            job_id, user_id, file_count, total_processing_time,
+            0, batch_size if 'batch_size' in locals() else 1, False, str(e)
+        )
         
         # Mark job as failed (this will trigger WebSocket notification)
         error_message = str(e)
