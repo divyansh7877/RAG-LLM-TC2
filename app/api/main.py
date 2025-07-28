@@ -20,36 +20,44 @@ import uvicorn
 from ..shared.config import config
 from ..shared.redis_client import redis_client
 from ..shared.middleware import auth_middleware, rate_limiter
+from ..shared.error_handling import error_handler, set_log_context, clear_log_context, StructuredLogger
+from ..shared.monitoring import metric_collector, alert_manager, health_checker, start_monitoring_thread
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Set up structured logging
+logger = StructuredLogger(__name__)
 
 # Security
 security = HTTPBearer()
 
 
 class RequestLoggingMiddleware:
-    """Middleware for request logging and monitoring."""
+    """Enhanced middleware for request logging and monitoring with error handling."""
     
     def __init__(self, app: FastAPI):
         self.app = app
     
     async def __call__(self, request: Request, call_next):
-        """Process request with logging and monitoring."""
+        """Process request with enhanced logging, monitoring, and error handling."""
         # Generate request ID
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
         
+        # Extract client information
+        client_ip = request.client.host if request.client else "unknown"
+        user_agent = request.headers.get("user-agent", "unknown")
+        
+        # Set log context for this request
+        set_log_context(
+            request_id=request_id,
+            endpoint=request.url.path,
+            ip_address=client_ip,
+            user_agent=user_agent
+        )
+        
         # Log request start
         start_time = time.time()
-        client_ip = request.client.host if request.client else "unknown"
-        
         logger.info(
-            f"Request started - ID: {request_id}, Method: {request.method}, "
+            f"Request started - Method: {request.method}, "
             f"Path: {request.url.path}, Client: {client_ip}"
         )
         
@@ -60,23 +68,27 @@ class RequestLoggingMiddleware:
             # Log successful response
             process_time = time.time() - start_time
             logger.info(
-                f"Request completed - ID: {request_id}, Status: {response.status_code}, "
+                f"Request completed - Status: {response.status_code}, "
                 f"Time: {process_time:.3f}s"
             )
             
-            # Add request ID to response headers
+            # Add request ID and timing to response headers
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{process_time:.3f}"
             
             return response
             
         except Exception as e:
-            # Log error
+            # Handle error through centralized system
             process_time = time.time() - start_time
-            logger.error(
-                f"Request failed - ID: {request_id}, Error: {str(e)}, "
-                f"Time: {process_time:.3f}s"
-            )
+            
+            error_context = error_handler.handle_error(e, {
+                'request_method': request.method,
+                'request_path': request.url.path,
+                'process_time': process_time,
+                'client_ip': client_ip,
+                'user_agent': user_agent
+            })
             
             # Return structured error response
             return JSONResponse(
@@ -86,11 +98,16 @@ class RequestLoggingMiddleware:
                         "code": "INTERNAL_SERVER_ERROR",
                         "message": "An internal server error occurred",
                         "request_id": request_id,
+                        "error_id": error_context.error_id,
                         "timestamp": datetime.utcnow().isoformat() + "Z"
                     }
                 },
-                headers={"X-Request-ID": request_id}
+                headers={"X-Request-ID": request_id, "X-Error-ID": error_context.error_id}
             )
+        
+        finally:
+            # Clear log context
+            clear_log_context()
 
 
 class ResponseFormattingMiddleware:
@@ -112,28 +129,54 @@ class ResponseFormattingMiddleware:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan events."""
+    """Application lifespan events with enhanced monitoring and error handling."""
     # Startup
     logger.info("Starting FastAPI application...")
     
-    # Check Redis connection
-    if not redis_client.health_check():
-        logger.warning("Redis connection failed")
-    else:
-        logger.info("Redis connection successful")
-    
-    # Initialize middleware components
-    logger.info("Initializing middleware components...")
-    
-    # Initialize job notification service
-    from ..shared.job_notifications import job_notification_service
-    job_notification_service.initialize()
-    logger.info("Job notification service initialized")
+    try:
+        # Check Redis connection
+        if not redis_client.health_check():
+            logger.warning("Redis connection failed")
+        else:
+            logger.info("Redis connection successful")
+        
+        # Initialize middleware components
+        logger.info("Initializing middleware components...")
+        
+        # Initialize job notification service
+        from ..shared.job_notifications import job_notification_service
+        job_notification_service.initialize()
+        logger.info("Job notification service initialized")
+        
+        # Start monitoring thread
+        logger.info("Starting system monitoring...")
+        monitoring_thread = start_monitoring_thread(interval=60)  # Monitor every minute
+        logger.info("System monitoring started")
+        
+        # Setup alert callbacks for critical alerts
+        def critical_alert_callback(alert):
+            """Handle critical alerts."""
+            if alert.level.value == "critical":
+                logger.critical(f"CRITICAL ALERT: {alert.title} - {alert.message}")
+                # In production, you might want to send notifications here
+        
+        alert_manager.add_alert_callback(critical_alert_callback)
+        logger.info("Alert system initialized")
+        
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'application_startup'})
+        logger.error(f"Error during application startup: {e}")
+        # Continue startup even if monitoring fails
     
     yield
     
     # Shutdown
     logger.info("Shutting down FastAPI application...")
+    try:
+        # Cleanup monitoring resources if needed
+        logger.info("Monitoring system shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 
 # Create FastAPI app
@@ -259,17 +302,26 @@ async def api_root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    redis_healthy = redis_client.health_check()
-    
-    return {
-        "status": "healthy" if redis_healthy else "unhealthy",
-        "services": {
-            "redis": redis_healthy,
-            "api": True
-        },
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
+    """Enhanced health check endpoint with comprehensive system monitoring."""
+    try:
+        # Run all registered health checks
+        health_results = health_checker.run_health_checks()
+        
+        return {
+            "status": "healthy" if health_results["overall_healthy"] else "unhealthy",
+            "checks": health_results["checks"],
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'health_check'})
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "error": "Health check system failure",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
 
 
 @app.get("/api/status")
@@ -324,6 +376,245 @@ async def api_status():
                     "timestamp": datetime.utcnow().isoformat() + "Z"
                 }
             }
+        )
+
+
+# Enhanced monitoring and error handling endpoints
+@app.get("/api/monitoring/metrics", tags=["Monitoring"])
+async def get_system_metrics(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get current system metrics.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Current system metrics
+    """
+    try:
+        # Collect current metrics
+        metrics = metric_collector.collect_system_metrics()
+        
+        return {
+            "metrics": metrics.to_dict(),
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_system_metrics'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Metrics collection service error"
+        )
+
+
+@app.get("/api/monitoring/metrics/history", tags=["Monitoring"])
+async def get_metrics_history(
+    hours: int = 24,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get historical system metrics.
+    
+    Args:
+        hours: Number of hours of history to retrieve (default: 24)
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Historical system metrics
+    """
+    try:
+        # Validate hours parameter
+        if hours < 1 or hours > 168:  # Max 1 week
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Hours parameter must be between 1 and 168"
+            )
+        
+        history = metric_collector.get_metrics_history(hours=hours)
+        
+        return {
+            "metrics_history": history,
+            "period_hours": hours,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_metrics_history'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Metrics history service error"
+        )
+
+
+@app.get("/api/monitoring/alerts", tags=["Monitoring"])
+async def get_active_alerts(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get all active system alerts.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Active system alerts
+    """
+    try:
+        active_alerts = alert_manager.get_active_alerts()
+        
+        return {
+            "active_alerts": active_alerts,
+            "alert_count": len(active_alerts),
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_active_alerts'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Alert service error"
+        )
+
+
+@app.get("/api/monitoring/alerts/history", tags=["Monitoring"])
+async def get_alert_history(
+    hours: int = 24,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get alert history.
+    
+    Args:
+        hours: Number of hours of history to retrieve (default: 24)
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Alert history
+    """
+    try:
+        # Validate hours parameter
+        if hours < 1 or hours > 168:  # Max 1 week
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Hours parameter must be between 1 and 168"
+            )
+        
+        history = alert_manager.get_alert_history(hours=hours)
+        
+        return {
+            "alert_history": history,
+            "period_hours": hours,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_alert_history'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Alert history service error"
+        )
+
+
+@app.get("/api/monitoring/errors", tags=["Monitoring"])
+async def get_error_statistics(
+    days: int = 7,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get error statistics and recent errors.
+    
+    Args:
+        days: Number of days of statistics to retrieve (default: 7)
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Error statistics and recent errors
+    """
+    try:
+        # Validate days parameter
+        if days < 1 or days > 30:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Days parameter must be between 1 and 30"
+            )
+        
+        error_stats = error_handler.get_error_statistics(days=days)
+        recent_errors = error_handler.get_recent_errors(limit=50)
+        
+        return {
+            "error_statistics": error_stats,
+            "recent_errors": recent_errors,
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_error_statistics'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error statistics service error"
+        )
+
+
+@app.get("/api/monitoring/health/detailed", tags=["Monitoring"])
+async def get_detailed_health_status(
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get detailed health status of all system components.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Detailed health status
+    """
+    try:
+        # Run comprehensive health checks
+        health_results = health_checker.run_health_checks()
+        
+        # Get current metrics for additional context
+        current_metrics = metric_collector.collect_system_metrics()
+        
+        # Get active alerts that might affect health
+        active_alerts = alert_manager.get_active_alerts()
+        critical_alerts = [alert for alert in active_alerts if alert.get('level') == 'critical']
+        
+        return {
+            "overall_health": health_results,
+            "current_metrics": current_metrics.to_dict(),
+            "critical_alerts": critical_alerts,
+            "health_summary": {
+                "overall_healthy": health_results["overall_healthy"],
+                "total_checks": len(health_results["checks"]),
+                "failed_checks": len([
+                    check for check in health_results["checks"].values() 
+                    if not check.get("healthy", False)
+                ]),
+                "critical_alert_count": len(critical_alerts)
+            },
+            "requested_by": current_user.user_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        error_handler.handle_error(e, {'operation': 'get_detailed_health_status'})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Health status service error"
         )
 
 
