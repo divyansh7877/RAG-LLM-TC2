@@ -17,14 +17,7 @@ from ..shared.config import config
 from ..shared.job_manager import job_manager
 
 # Import embedding functionality
-import fitz  # PyMuPDF
-import lancedb
-from llama_index.core import Settings, StorageContext, VectorStoreIndex
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import Document as LlamaDocument
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.lancedb import LanceDBVectorStore
-import re
+from ..shared.document_processor import document_processor, get_document_info, estimate_processing_time
 import hashlib
 import uuid
 
@@ -43,37 +36,6 @@ EMBEDDING_METRICS_KEY = "performance:embedding_metrics"
 SLOW_EMBEDDING_THRESHOLD = 30.0  # seconds per file
 
 
-def extract_pages_from_pdf(pdf_path: str) -> List[Tuple[str, int]]:
-    """Extract text from PDF pages with error handling."""
-    try:
-        doc = fitz.open(pdf_path)
-        pages: List[Tuple[str, int]] = []
-        for i in range(len(doc)):
-            try:
-                page_text = doc.load_page(i).get_text()
-                pages.append((page_text, i + 1))
-            except Exception as e:
-                logger.warning(f"Failed to extract text from page {i+1} of {pdf_path}: {e}")
-                pages.append(("", i + 1))  # Add empty page to maintain page numbering
-        doc.close()
-        return pages
-    except Exception as e:
-        logger.error(f"Failed to open PDF {pdf_path}: {e}")
-        raise ValueError(f"Cannot process PDF file: {e}")
-
-
-def clean_text(raw_text: str) -> str:
-    """Clean and normalize text content."""
-    if not raw_text:
-        return ""
-    
-    # Basic cleanup: trim spaces and collapse excess newlines/spaces
-    txt = re.sub(r"\n{3,}", "\n\n", raw_text)
-    txt = "\n".join(line.strip() for line in txt.split("\n"))
-    txt = re.sub(r" {2,}", " ", txt)
-    return txt.strip()
-
-
 def calculate_file_hash(file_path: str) -> str:
     """Calculate SHA-256 hash of file content for deduplication."""
     hash_sha256 = hashlib.sha256()
@@ -85,177 +47,6 @@ def calculate_file_hash(file_path: str) -> str:
     except Exception as e:
         logger.error(f"Failed to calculate hash for {file_path}: {e}")
         return str(uuid.uuid4())  # Fallback to UUID if hashing fails
-
-
-def create_nodes_from_pdf(pdf_path: str, user_id: str, group_id: str) -> List:
-    """Create LlamaIndex nodes from a single PDF with user isolation metadata."""
-    document_name = os.path.basename(pdf_path)
-    file_size = os.path.getsize(pdf_path)
-    file_hash = calculate_file_hash(pdf_path)
-    
-    # Extract pages
-    pages = extract_pages_from_pdf(pdf_path)
-    
-    # Create LlamaIndex documents
-    documents: List[LlamaDocument] = []
-    for text, page_number in pages:
-        cleaned_text = clean_text(text)
-        if not cleaned_text:  # Skip empty pages
-            continue
-            
-        metadata = {
-            "document_name": document_name,
-            "page_number": page_number,
-            "user_id": user_id,
-            "group_id": group_id,
-            "file_size": file_size,
-            "file_hash": file_hash,
-            "upload_date": time.time(),
-            "content_type": "application/pdf"
-        }
-        
-        documents.append(
-            LlamaDocument(
-                text=cleaned_text,
-                metadata=metadata,
-                id_=f"{user_id}_{group_id}_{document_name}_p{page_number}",
-            )
-        )
-    
-    if not documents:
-        raise ValueError(f"No readable content found in PDF: {document_name}")
-    
-    # Split documents into chunks
-    splitter = SentenceSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        include_metadata=True,
-    )
-    
-    nodes = splitter.get_nodes_from_documents(documents)
-    logger.info(f"Created {len(nodes)} nodes from {document_name} ({len(pages)} pages)")
-    
-    return nodes
-
-
-def create_nodes_from_pdfs_batch(file_paths: List[str], user_id: str, group_id: str, 
-                                batch_size: int = 5) -> Tuple[List, List[Dict], List[Dict]]:
-    """
-    Create LlamaIndex nodes from multiple PDFs in batches for optimized processing.
-    
-    Args:
-        file_paths: List of PDF file paths to process
-        user_id: User identifier for metadata
-        group_id: Group identifier for metadata
-        batch_size: Number of files to process in each batch
-        
-    Returns:
-        Tuple of (all_nodes, processed_files, failed_files)
-    """
-    all_nodes = []
-    processed_files = []
-    failed_files = []
-    
-    # Process files in batches to optimize memory usage
-    for i in range(0, len(file_paths), batch_size):
-        batch_files = file_paths[i:i + batch_size]
-        logger.info(f"Processing batch {i//batch_size + 1}: {len(batch_files)} files")
-        
-        batch_nodes = []
-        batch_documents = []
-        
-        # First pass: extract text from all files in batch
-        for file_path in batch_files:
-            try:
-                filename = os.path.basename(file_path)
-                
-                # Check for duplicates
-                file_hash = calculate_file_hash(file_path)
-                if check_duplicate_document(user_id, group_id, file_hash):
-                    logger.info(f"Skipping duplicate file: {filename}")
-                    processed_files.append({
-                        "filename": filename,
-                        "status": "skipped",
-                        "reason": "duplicate"
-                    })
-                    continue
-                
-                # Extract pages and create documents
-                pages = extract_pages_from_pdf(file_path)
-                file_size = os.path.getsize(file_path)
-                
-                for text, page_number in pages:
-                    cleaned_text = clean_text(text)
-                    if not cleaned_text:  # Skip empty pages
-                        continue
-                        
-                    metadata = {
-                        "document_name": filename,
-                        "page_number": page_number,
-                        "user_id": user_id,
-                        "group_id": group_id,
-                        "file_size": file_size,
-                        "file_hash": file_hash,
-                        "upload_date": time.time(),
-                        "content_type": "application/pdf"
-                    }
-                    
-                    batch_documents.append(
-                        LlamaDocument(
-                            text=cleaned_text,
-                            metadata=metadata,
-                            id_=f"{user_id}_{group_id}_{filename}_p{page_number}",
-                        )
-                    )
-                
-                processed_files.append({
-                    "filename": filename,
-                    "status": "processed",
-                    "page_count": len(pages),
-                    "file_hash": file_hash
-                })
-                
-                logger.debug(f"Extracted text from {filename}: {len(pages)} pages")
-                
-            except Exception as e:
-                logger.error(f"Failed to process file {file_path}: {e}")
-                failed_files.append({
-                    "filename": os.path.basename(file_path),
-                    "error": str(e)
-                })
-        
-        # Second pass: batch process documents into chunks
-        if batch_documents:
-            try:
-                # Use batch processing for chunking - more efficient than individual processing
-                splitter = SentenceSplitter(
-                    chunk_size=CHUNK_SIZE,
-                    chunk_overlap=CHUNK_OVERLAP,
-                    include_metadata=True,
-                )
-                
-                batch_nodes = splitter.get_nodes_from_documents(batch_documents)
-                all_nodes.extend(batch_nodes)
-                
-                logger.info(f"Batch {i//batch_size + 1}: Created {len(batch_nodes)} nodes from {len(batch_documents)} documents")
-                
-            except Exception as e:
-                logger.error(f"Failed to create nodes for batch {i//batch_size + 1}: {e}")
-                # Mark all files in this batch as failed
-                for file_path in batch_files:
-                    filename = os.path.basename(file_path)
-                    if not any(f["filename"] == filename for f in failed_files):
-                        failed_files.append({
-                            "filename": filename,
-                            "error": f"Batch processing failed: {e}"
-                        })
-        
-        # Clear batch data to free memory
-        batch_documents.clear()
-        batch_nodes.clear()
-    
-    logger.info(f"Batch processing completed: {len(all_nodes)} total nodes from {len(processed_files)} files")
-    return all_nodes, processed_files, failed_files
 
 
 def check_duplicate_document(user_id: str, group_id: str, file_hash: str) -> bool:
@@ -516,7 +307,7 @@ def get_embedding_performance_stats(days: int = 7) -> Dict[str, Any]:
                 autoretry_for=(Exception,), retry_kwargs={'max_retries': 3, 'countdown': 60})
 def process_document_embedding(self, job_id: str, user_id: str, group_id: str, file_paths: List[str]):
     """
-    Process document embedding with comprehensive progress tracking and user isolation.
+    Process document embedding using the document processor service.
     
     Args:
         job_id: Unique job identifier
@@ -531,10 +322,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         ValueError: For invalid input or processing errors
         Retry: For retryable errors
     """
-    temp_dir = None
-    processed_files = []
-    failed_files = []
-    start_time = time.time()  # Track start time for performance metrics
+    start_time = time.time()
     
     try:
         # Validate inputs
@@ -549,123 +337,90 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         
         logger.info(f"Starting embedding job {job_id} for user {user_id}, group {group_id}, {len(file_paths)} files")
         
-        # Initialize embedding model (singleton per worker)
-        Settings.embed_model = HuggingFaceEmbedding(
-            model_name=EMBED_MODEL_NAME,
-            device="cpu",  # Use CPU for stability in worker environment
-            trust_remote_code=True,
+        # Update progress
+        update_job_progress(job_id, 0.1, "Starting document processing...")
+        
+        # Use the document processor service
+        result = document_processor.process_documents(
+            file_paths=file_paths,
+            user_id=user_id,
+            group_id=group_id,
+            job_id=job_id,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            db_path=DB_PATH,
+            table_name=TABLE_NAME,
+            embed_model_name=EMBED_MODEL_NAME,
+            device="cpu"
         )
         
-        # Connect to LanceDB
-        ldb = lancedb.connect(DB_PATH)
-        vector_store = LanceDBVectorStore(uri=DB_PATH, table_name=TABLE_NAME)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        if not result.success:
+            raise ValueError(result.error or "Document processing failed")
         
-        # Validate all files exist and are readable
-        total_files = len(file_paths)
+        # Store document metadata for processed files
+        processed_files = []
+        failed_files = []
+        
         for file_path in file_paths:
-            if not os.path.exists(file_path):
-                raise ValueError(f"File not found: {file_path}")
-            if not os.access(file_path, os.R_OK):
-                raise ValueError(f"File not readable: {file_path}")
-        
-        update_job_progress(job_id, 0.1, "Starting batch processing...")
-        
-        # Use batch processing for better performance
-        batch_size = min(5, max(1, total_files // 2))  # Adaptive batch size
-        all_nodes, processed_files, failed_files = create_nodes_from_pdfs_batch(
-            file_paths, user_id, group_id, batch_size
-        )
-        
-        # Store document metadata for successfully processed files
-        for file_info in processed_files:
-            if file_info["status"] == "processed":
-                try:
-                    # Find the original file path
-                    original_path = next(
-                        path for path in file_paths 
-                        if os.path.basename(path) == file_info["filename"]
-                    )
-                    
-                    # Count chunks for this specific file
-                    file_chunks = [
-                        node for node in all_nodes 
-                        if node.metadata.get("document_name") == file_info["filename"]
-                    ]
-                    
-                    document_id = store_document_metadata(
-                        user_id, group_id, original_path, 
-                        file_info["page_count"], len(file_chunks)
-                    )
-                    
-                    file_info["document_id"] = document_id
-                    file_info["chunk_count"] = len(file_chunks)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to store metadata for {file_info['filename']}: {e}")
-                    # Move to failed files
-                    failed_files.append({
-                        "filename": file_info["filename"],
-                        "error": f"Metadata storage failed: {e}"
-                    })
-        
-        # Remove files that failed metadata storage from processed_files
-        processed_files = [
-            f for f in processed_files 
-            if f["status"] != "processed" or "document_id" in f
-        ]
-        
-        # Update progress for embedding phase
-        update_job_progress(job_id, 0.8, "Creating vector embeddings...")
-        
-        # Create or update vector index if we have nodes
-        if all_nodes:
             try:
-                index = VectorStoreIndex(
-                    all_nodes, 
-                    storage_context=storage_context, 
-                    show_progress=False  # Disable progress bar in worker
+                filename = os.path.basename(file_path)
+                doc_info = get_document_info(file_path)
+                
+                if "error" in doc_info:
+                    failed_files.append({
+                        "filename": filename,
+                        "error": doc_info["error"]
+                    })
+                    continue
+                
+                # Store document metadata
+                document_id = store_document_metadata(
+                    user_id, group_id, file_path,
+                    doc_info["page_count"], 
+                    result.chunk_count // result.document_count  # Approximate chunks per file
                 )
                 
-                # Persist index metadata
-                persist_dir = os.path.join(DB_PATH, "li_storage")
-                index.storage_context.persist(persist_dir)
-                
-                # Verify storage
-                table = ldb.open_table(TABLE_NAME)
-                total_vectors = table.count_rows()
-                logger.info(f"Successfully stored {len(all_nodes)} new vectors. Total vectors in DB: {total_vectors}")
+                processed_files.append({
+                    "filename": filename,
+                    "status": "processed",
+                    "page_count": doc_info["page_count"],
+                    "document_id": document_id,
+                    "file_size": doc_info["file_size"]
+                })
                 
             except Exception as e:
-                logger.error(f"Failed to create vector index: {e}")
-                raise ValueError(f"Vector indexing failed: {e}")
+                logger.error(f"Failed to store metadata for {os.path.basename(file_path)}: {e}")
+                failed_files.append({
+                    "filename": os.path.basename(file_path),
+                    "error": f"Metadata storage failed: {e}"
+                })
         
         # Final progress update
         update_job_progress(job_id, 1.0, "Embedding completed successfully")
         
-        # Mark job as completed
-        result = {
-            "total_files": total_files,
+        # Prepare final result
+        final_result = {
+            "total_files": len(file_paths),
             "processed_files": len(processed_files),
             "failed_files": len(failed_files),
-            "total_chunks": len(all_nodes),
+            "total_chunks": result.chunk_count,
             "processed_details": processed_files,
             "failed_details": failed_files,
-            "message": f"Successfully processed {len(processed_files)} of {total_files} files"
+            "processing_time": result.processing_time,
+            "message": f"Successfully processed {len(processed_files)} of {len(file_paths)} files"
         }
         
         # Record performance metrics
-        total_processing_time = time.time() - start_time
         record_embedding_performance_metrics(
-            job_id, user_id, total_files, total_processing_time,
-            len(all_nodes), batch_size, True
+            job_id, user_id, len(file_paths), result.processing_time,
+            result.chunk_count, 5, True  # Default batch size of 5
         )
         
         # Update job status to completed (this will trigger WebSocket notification)
-        job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
+        job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=final_result)
         
         logger.info(f"Completed embedding job {job_id}: {len(processed_files)} processed, {len(failed_files)} failed")
-        return result
+        return final_result
         
     except Exception as e:
         logger.error(f"Embedding job {job_id} failed: {e}")
@@ -680,7 +435,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         file_count = len(file_paths) if file_paths else 0
         record_embedding_performance_metrics(
             job_id, user_id, file_count, total_processing_time,
-            0, batch_size if 'batch_size' in locals() else 1, False, str(e)
+            0, 5, False, str(e)  # Default batch size of 5
         )
         
         # Mark job as failed (this will trigger WebSocket notification)
@@ -689,14 +444,6 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         
         # Re-raise for Celery error handling
         raise
-    
-    finally:
-        # Cleanup temporary files
-        if temp_dir and os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp directory {temp_dir}: {e}")
 
 
 @celery_app.task(name="cleanup_failed_embeddings")

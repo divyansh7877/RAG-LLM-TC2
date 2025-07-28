@@ -1,69 +1,73 @@
-# Project: Multi-User Private RAG System
+# Project: Concurrent Multi-User Private RAG System
 
 ## 1. Objective
 
-This project provides a secure, multi-user, and private Retrieval-Augmented Generation (RAG) system. It allows different users to upload their own private PDF documents, which are then used as a knowledge base for a local Large Language Model (LLM). The system is designed to be modular, enabling easy customization of its core components like the LLM, embedding models, and retrieval strategies.
+This project provides a secure, concurrent, multi-user, and private Retrieval-Augmented Generation (RAG) system. It allows multiple users to simultaneously upload their own private PDF documents and query them using a local Large Language Model (LLM). The system has been transformed from a single-threaded application into a robust, production-ready system that can handle concurrent operations safely and efficiently.
 
 The key goals are:
-- **Data Privacy:** Ensure users can only query their own documents or documents from groups they belong to.
+- **Data Privacy:** Ensure users can only query their own documents or documents from groups they belong to, with complete isolation between users.
+- **Concurrency:** Support multiple users simultaneously without data leakage or performance degradation.
 - **Local First:** All components, including the LLM and vector database, run locally to prevent data from leaving the machine.
 - **Accurate & Citable Answers:** The LLM is prompted to answer questions based *only* on the provided documents and to cite its sources by document name and page number.
+- **Production Ready:** Includes comprehensive error handling, monitoring, job management, and real-time updates.
 
 ---
 
 ## 2. Features
 
-- **User Authentication:** A simple login system to manage access.
+- **Concurrent User Support:** Multiple users can simultaneously upload documents and query the system without data leakage or performance issues.
+- **JWT-based Authentication:** Secure token-based authentication with session management.
 - **Multi-Tenant Data Storage:** Documents are associated with a `user_id` and `group_id`, allowing for both personal and shared knowledge bases.
-- **PDF Document Upload:** Users can upload PDF files through a web interface.
+- **Background Job Processing:** Document uploads and queries are processed asynchronously using Celery workers.
+- **Real-time Updates:** WebSocket connections provide real-time job status updates and progress tracking.
+- **Modern Web Interface:** FastAPI-based REST API with a responsive HTML/CSS/JavaScript frontend.
 - **End-to-End RAG Pipeline:**
-    - **Ingestion:** Extracts text, splits it into chunks, and generates embeddings.
-    - **Storage:** Stores embeddings and metadata in a LanceDB vector database.
-    - **Retrieval:** Fetches relevant document chunks based on the user's query and access rights.
+    - **Ingestion:** Extracts text, splits it into chunks, and generates embeddings using background workers.
+    - **Storage:** Stores embeddings and metadata in a LanceDB vector database with proper user isolation.
+    - **Retrieval:** Fetches relevant document chunks based on the user's query and access rights with thread-safe filtering.
     - **Reranking:** Refines the retrieved results for better relevance.
     - **Generation:** Uses a local LLM to synthesize an answer from the retrieved context.
-- **Web Interface:** A user-friendly UI built with Gradio for easy interaction.
+- **Job Management:** Track, monitor, and manage document processing and query jobs with detailed status reporting.
+- **Resource Management:** Intelligent resource allocation and monitoring to prevent system overload.
+- **Comprehensive Monitoring:** System health checks, performance metrics, and error tracking.
 
 ---
 
 ## 3. System Architecture
 
-The application is composed of three main Python scripts within the `app/` directory, orchestrated by a Gradio frontend.
+The system has been completely redesigned as a modern, concurrent web application with the following architecture:
 
-### `app/main.py`: The Frontend and Orchestrator
+### Frontend Layer
+- **FastAPI Web Application** (`app/api/main.py`): REST API endpoints with WebSocket support for real-time updates
+- **Modern Web Interface** (`app/static/`): Responsive HTML/CSS/JavaScript frontend replacing Gradio
+- **Authentication**: JWT-based token authentication with secure session management
 
-- **Responsibilities:**
-    - Renders the Gradio web UI.
-    - Manages the user login flow and maintains user session state.
-    - Handles the file upload interface, calling the embedding script as a subprocess.
-    - Provides the query interface, passing user questions and credentials to the RAG engine.
-- **User Management:** A simple dictionary `USERS` holds usernames, passwords, and group memberships.
+### Application Layer
+- **Session Manager** (`app/shared/session_manager.py`): Redis-backed distributed session management
+- **Job Manager** (`app/shared/job_manager.py`): Comprehensive job lifecycle management and tracking
+- **Resource Manager** (`app/shared/resource_manager.py`): Intelligent resource allocation and monitoring
+- **Query Engine Factory** (`app/shared/query_engine_factory.py`): Thread-safe query engine with connection pooling
 
-### `app/new_embedder.py`: The Ingestion and Embedding Service
+### Task Processing Layer
+- **Celery Workers**: Background task processing with proper resource management
+  - **Embedding Workers** (`app/workers/embedding_worker.py`): Process document uploads asynchronously
+  - **Query Workers** (`app/workers/query_worker.py`): Handle user queries with security isolation
+  - **Maintenance Workers** (`app/workers/maintenance_worker.py`): System cleanup and monitoring
+- **Redis Queue**: Message broker and result backend for task distribution
 
-- **Trigger:** Called by `main.py` when a user uploads files.
-- **Process:**
-    1.  Receives a list of PDF file paths, along with the `user_id` and `group_id` of the owner.
-    2.  Uses `PyMuPDF` to extract text from each page of the PDFs.
-    3.  Cleans and splits the text into manageable chunks using `LlamaIndex`'s `SentenceSplitter`.
-    4.  **Crucially, it attaches the `user_id` and `group_id` as metadata to each chunk.**
-    5.  Uses the `gte-large-en-v1.5` sentence transformer to create vector embeddings for each chunk.
-    6.  Connects to the `multi_user_db.lance` LanceDB database and stores the embeddings and their associated metadata.
+### Data Layer
+- **LanceDB Vector Store**: Stores document embeddings with user isolation metadata
+- **Redis**: Session storage, job tracking, and caching
+- **Document Processor** (`app/shared/document_processor.py`): PDF processing and embedding service
+- **PDF Utils** (`app/shared/pdf_utils.py`): Centralized PDF text extraction utilities
 
-### `app/new_rag_ui.py`: The Secure RAG Query Engine
+### Key Architectural Improvements
 
-- **Responsibilities:**
-    - Initializes and holds the core components: the LLM, the embedding model, and the connection to the vector store.
-    - Provides the `process_query` function that securely answers user questions.
-- **Process:**
-    1.  **Initialization (at startup):** Loads the `Llama-3.2-3B` GGUF model via `LlamaCPP` and the `gte-large-en-v1.5` embedding model. This is done only once to ensure good performance.
-    2.  **Query Handling (per request):**
-        a. Receives the query text, `user_id`, and `group_ids` from `main.py`.
-        b. **Security Enforcement:** Creates metadata filters to search the vector database for chunks that match **either** the `user_id` (for personal documents) **or** one of the user's `group_ids`.
-        c. **Retrieval:** Performs a vector search in LanceDB using these filters to find the most relevant document chunks the user is allowed to see.
-        d. **Reranking:** Uses a `cross-encoder` model to re-rank the retrieved chunks for higher relevance.
-        e. **Synthesis:** Passes the original question and the context from the reranked chunks to the LLM using a specific prompt template.
-        f. **Citation:** The final answer includes citations to the source document and page number.
+1. **Thread Safety**: All components are designed for concurrent access with proper locking mechanisms
+2. **User Isolation**: Complete data separation between users with metadata filtering at every level
+3. **Scalability**: Horizontal scaling support through Celery workers and Redis clustering
+4. **Monitoring**: Comprehensive health checks, performance metrics, and error tracking
+5. **Real-time Updates**: WebSocket connections for live job status and progress updates
 
 ---
 
@@ -72,7 +76,9 @@ The application is composed of three main Python scripts within the `app/` direc
 -   **LLM:** `Llama-3.2-3B-Instruct-IQ3_M.gguf` (a quantized model for efficient local inference).
 -   **Embedding Model:** `Alibaba-NLP/gte-large-en-v1.5` (quantized for CPU performance).
 -   **Vector Database:** `LanceDB` (for efficient, file-based vector storage).
--   **Core Frameworks:** `LlamaIndex` (for the RAG pipeline), `Gradio` (for the UI).
+-   **Task Queue:** `Redis` + `Celery` (for background job processing and message brokering).
+-   **Web Framework:** `FastAPI` (for REST API and WebSocket support).
+-   **Core Frameworks:** `LlamaIndex` (for the RAG pipeline), `Redis` (for caching and sessions).
 
 ---
 
@@ -94,36 +100,90 @@ The application is composed of three main Python scripts within the `app/` direc
 
 ### Running the Application
 
-To start the web interface, run the main application file:
+The concurrent system requires multiple components to be running:
 
-```bash
-python app/main.py
-```
+1. **Start Redis server:**
+   ```bash
+   ./setup_redis.sh
+   ```
 
-This will launch the Gradio server. Open the provided URL in your browser to access the application.
+2. **Start the FastAPI web application:**
+   ```bash
+   python -m app.api.main
+   ```
+
+3. **Start Celery workers (in separate terminals):**
+   ```bash
+   # Start all workers
+   ./start_workers.sh
+   
+   # Or start individual worker types
+   celery -A app.workers.celery_app worker --queues=embedding --concurrency=2
+   celery -A app.workers.celery_app worker --queues=query --concurrency=4
+   celery -A app.workers.celery_app worker --queues=maintenance --concurrency=1
+   ```
+
+4. **Access the application:**
+   Open your browser to `http://localhost:8000` to access the modern web interface.
 
 ### How to Use
 
-1.  **Login:** Use one of the credentials defined in `app/main.py`.
-    -   e.g., Username: `assistant1`, Password: `password1`
-2.  **Upload Documents:** Navigate to the "Upload" tab, select your PDF files, choose a destination ("Personal" or a shared group), and click "Upload".
-3.  **Query Documents:** Navigate to the "Query" tab, type your question, and click "Submit". The model will generate an answer based on the documents you have access to.
+1.  **Login:** Use the authentication system with JWT tokens.
+    -   Default credentials are defined in the authentication manager
+2.  **Upload Documents:** 
+    - Navigate to the "Upload Documents" tab
+    - Select your PDF files using drag-and-drop or file browser
+    - Choose a destination group
+    - Upload files are processed asynchronously with real-time progress updates
+3.  **Query Documents:** 
+    - Navigate to the "Query Documents" tab
+    - Type your question and submit
+    - Queries are processed in the background with real-time status updates
+4.  **Monitor Jobs:**
+    - Navigate to the "Job Status" tab to track all your document processing and query jobs
+    - View real-time progress, completion status, and error details
 
 ---
 
 ## 6. Modularity and Customization
 
-The system is designed to be modular:
+The system is designed to be modular and easily customizable:
 
--   **LLM:** To use a different model, change the `GGUF_MODEL_PATH` in `app/new_rag_ui.py` to point to another GGUF-compatible file.
--   **Retriever:** The retrieval logic in `app/new_rag_ui.py` can be modified to use different LlamaIndex retrievers (e.g., hybrid search, different MMR settings).
--   **Data Formats:** The embedding script (`app/new_embedder.py`) can be extended to support other file types (e.g., `.txt`, `.docx`) by adding new data loaders.
+-   **LLM:** To use a different model, change the `GGUF_MODEL_PATH` in `app/shared/query_engine_factory.py` to point to another GGUF-compatible file.
+-   **Retriever:** The retrieval logic in the query engine factory can be modified to use different LlamaIndex retrievers (e.g., hybrid search, different MMR settings).
+-   **Data Formats:** The document processor (`app/shared/document_processor.py`) can be extended to support other file types (e.g., `.txt`, `.docx`) by adding new data loaders to the PDF utils.
+-   **Workers:** Additional worker types can be added to handle different processing tasks or integrate with external services.
+-   **Authentication:** The authentication system can be extended to integrate with external identity providers (LDAP, OAuth, etc.).
+-   **Storage:** The system can be configured to use different vector databases or add additional storage backends.
 
 ---
 
-## 7. Known Issues & Limitations
+## 7. Production Deployment
 
-**Concurrency:** The application in its current state is **NOT thread-safe** and will not handle concurrent users correctly.
+### Docker Support
+The system includes Docker containerization for easy deployment:
 
--   **Embedding:** Concurrent embedding requests will work but are highly inefficient, as each request launches a separate process that loads the entire embedding model into memory. This will lead to very high CPU and RAM usage.
--   **Querying:** The query engine is **not thread-safe**. If multiple users query simultaneously, there is a race condition that can cause the security filters to be applied incorrectly, leading to **data leakage** where one user might see results from another user's private documents. **This is a critical issue that must be fixed before use in a production or multi-user environment.**
+```bash
+# Build and run with docker-compose
+docker-compose up -d
+```
+
+### Monitoring and Observability
+- **Health Checks:** Comprehensive health check endpoints for all system components
+- **Metrics Collection:** Performance metrics for queries, embeddings, and system resources
+- **Error Tracking:** Centralized error handling with detailed logging and alerting
+- **Real-time Monitoring:** WebSocket-based real-time system status updates
+
+### Security Considerations
+- **User Isolation:** Complete data separation with metadata filtering at every level
+- **Session Security:** JWT tokens with configurable expiration and refresh mechanisms
+- **Rate Limiting:** Configurable rate limits to prevent abuse
+- **Input Validation:** Comprehensive input validation and sanitization
+- **Audit Logging:** Detailed audit trails for all user actions and system events
+
+### Performance Optimization
+- **Connection Pooling:** Efficient database connection management
+- **Query Caching:** Redis-based caching for frequently accessed queries
+- **Resource Management:** Intelligent resource allocation and monitoring
+- **Batch Processing:** Optimized batch processing for document uploads
+- **Horizontal Scaling:** Support for multiple worker instances and Redis clustering
