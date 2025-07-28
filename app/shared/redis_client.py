@@ -500,9 +500,60 @@ class RedisClient:
             logger.error(f"Get user queries error for user '{user_id}': {e}")
             return []
     
+    def reconnect(self):
+        """Attempt to reconnect to Redis servers."""
+        try:
+            # Close existing connections
+            self.client.connection_pool.disconnect()
+            self.session_client.connection_pool.disconnect()
+            
+            # Recreate connection pools
+            self.pool = redis.ConnectionPool.from_url(
+                config.REDIS_URL,
+                max_connections=20,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+                socket_keepalive_options={}
+            )
+            self.client = redis.Redis(connection_pool=self.pool, decode_responses=True)
+            
+            session_url = config.REDIS_URL.replace('/0', f'/{config.REDIS_SESSION_DB}')
+            self.session_pool = redis.ConnectionPool.from_url(
+                session_url,
+                max_connections=10,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+                socket_keepalive_options={}
+            )
+            self.session_client = redis.Redis(connection_pool=self.session_pool, decode_responses=True)
+            
+            # Test new connections
+            self._test_connections()
+            logger.info("Redis reconnection successful")
+            
+        except Exception as e:
+            logger.error(f"Redis reconnection failed: {e}")
+            raise RedisConnectionError(f"Reconnection failed: {e}")
+
     # Health and maintenance methods
-    def health_check(self) -> Dict[str, Any]:
-        """Comprehensive Redis health check."""
+    def health_check(self) -> bool:
+        """Simple Redis health check that returns boolean status."""
+        try:
+            # Test main Redis connection
+            with self.get_connection() as client:
+                client.ping()
+            
+            # Test session Redis connection
+            with self.get_connection(use_session_db=True) as client:
+                client.ping()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Redis health check failed: {e}")
+            return False
+    
+    def detailed_health_check(self) -> Dict[str, Any]:
+        """Comprehensive Redis health check with detailed information."""
         health_status = {
             "redis_main": False,
             "redis_sessions": False,
