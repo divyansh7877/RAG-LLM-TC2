@@ -9,9 +9,11 @@ from functools import wraps
 
 from .auth import auth_manager, AuthenticationError, TokenExpiredError, TokenInvalidError
 from .models import UserSession
+from .error_handling import error_handler, set_log_context, clear_log_context, with_error_handling, StructuredLogger
+from .monitoring import metric_collector, alert_manager
 
-# Set up logging
-logger = logging.getLogger(__name__)
+# Set up structured logging
+logger = StructuredLogger(__name__)
 
 # HTTP Bearer token scheme
 security = HTTPBearer(auto_error=False)
@@ -25,6 +27,7 @@ class AuthenticationMiddleware:
         self.auth_manager = auth_manager
         logger.info("AuthenticationMiddleware initialized")
     
+    @with_error_handling()
     async def get_current_user_optional(
         self, 
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
@@ -42,11 +45,23 @@ class AuthenticationMiddleware:
             return None
         
         try:
-            return self.auth_manager.get_current_user(credentials.credentials)
+            user_session = self.auth_manager.get_current_user(credentials.credentials)
+            if user_session:
+                # Set log context for this user
+                set_log_context(
+                    user_id=user_session.user_id,
+                    session_id=user_session.session_id
+                )
+            return user_session
         except Exception as e:
-            logger.debug(f"Optional authentication failed: {e}")
+            # Handle error through centralized system
+            error_handler.handle_error(e, {
+                'operation': 'optional_authentication',
+                'has_credentials': bool(credentials)
+            })
             return None
     
+    @with_error_handling()
     async def get_current_user(
         self, 
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
@@ -64,6 +79,14 @@ class AuthenticationMiddleware:
             HTTPException: If authentication fails
         """
         if not credentials:
+            error_context = {
+                'operation': 'authentication',
+                'error_type': 'missing_credentials'
+            }
+            error_handler.handle_error(
+                AuthenticationError("No credentials provided"), 
+                error_context
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required",
@@ -73,15 +96,30 @@ class AuthenticationMiddleware:
         try:
             user_session = self.auth_manager.get_current_user(credentials.credentials)
             if not user_session:
+                error_context = {
+                    'operation': 'authentication',
+                    'error_type': 'invalid_credentials'
+                }
+                error_handler.handle_error(
+                    AuthenticationError("Invalid credentials"), 
+                    error_context
+                )
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid authentication credentials",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             
+            # Set log context for authenticated user
+            set_log_context(
+                user_id=user_session.user_id,
+                session_id=user_session.session_id
+            )
+            
             return user_session
         
-        except TokenExpiredError:
+        except TokenExpiredError as e:
+            error_handler.handle_error(e, {'operation': 'authentication'})
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Token has expired",
@@ -89,6 +127,7 @@ class AuthenticationMiddleware:
             )
         
         except TokenInvalidError as e:
+            error_handler.handle_error(e, {'operation': 'authentication'})
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Invalid token: {e}",
@@ -96,6 +135,7 @@ class AuthenticationMiddleware:
             )
         
         except AuthenticationError as e:
+            error_handler.handle_error(e, {'operation': 'authentication'})
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Authentication failed: {e}",
@@ -103,6 +143,7 @@ class AuthenticationMiddleware:
             )
         
         except Exception as e:
+            error_handler.handle_error(e, {'operation': 'authentication'})
             logger.error(f"Authentication error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
