@@ -22,6 +22,14 @@ from ..shared.redis_client import redis_client
 from ..shared.middleware import auth_middleware, rate_limiter
 from ..shared.error_handling import error_handler, set_log_context, clear_log_context, StructuredLogger
 from ..shared.monitoring import metric_collector, alert_manager, health_checker, start_monitoring_thread
+from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
+from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
+
+# Authentication dependency functions
+get_current_user = auth_middleware.get_current_user
+get_current_user_optional = auth_middleware.get_current_user_optional
+validate_token = auth_middleware.validate_token_endpoint
+require_permissions = auth_middleware.require_permissions
 
 # Set up structured logging
 logger = StructuredLogger(__name__)
@@ -804,10 +812,7 @@ async def get_cache_performance_metrics(
         )
 
 
-# Authentication endpoints
-from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
-from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
-from ..shared.middleware import get_current_user, get_current_user_optional, rate_limiter, validate_token, require_permissions
+# Authentication endpoints are now imported at the top
 
 
 @app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
