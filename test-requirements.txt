@@ -1,0 +1,41 @@
+# Testing framework
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+pytest-xdist>=3.0.0
+pytest-timeout>=2.1.0
+pytest-mock>=3.10.0
+
+# HTTP testing
+httpx>=0.24.0
+requests>=2.28.0
+
+# Async testing
+asyncio-mqtt>=0.13.0
+
+# Performance testing
+pytest-benchmark>=4.0.0
+memory-profiler>=0.60.0
+
+# Security testing
+bandit>=1.7.0
+safety>=2.3.0
+
+# Code quality
+flake8>=5.0.0
+black>=22.0.0
+isort>=5.10.0
+mypy>=1.0.0
+
+# Mocking and fixtures
+responses>=0.22.0
+freezegun>=1.2.0
+factory-boy>=3.2.0
+
+# Database testing (if needed)
+pytest-redis>=3.0.0
+
+# Reporting
+pytest-html>=3.1.0
+pytest-json-report>=1.5.0
+allure-pytest>=2.12.0
