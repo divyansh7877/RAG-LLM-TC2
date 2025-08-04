@@ -404,6 +404,7 @@ class RAGApp {
             this.token = result.access_token;
             this.user = {
                 user_id: result.user_id,
+                username: result.username,
                 groups: result.groups
             };
 
@@ -463,6 +464,7 @@ class RAGApp {
         const session = await response.json();
         this.user = {
             user_id: session.user_id,
+            username: session.username,
             groups: session.groups
         };
     }
@@ -502,7 +504,7 @@ class RAGApp {
         if (loginForm) loginForm.style.display = 'none';
         if (mainApp) mainApp.style.display = 'block';
         if (userInfo) userInfo.style.display = 'flex';
-        if (userName && this.user) userName.textContent = this.user.user_id;
+        if (userName && this.user) userName.textContent = this.user.username;
 
         this.populateGroupSelects();
         this.loadDocuments();
