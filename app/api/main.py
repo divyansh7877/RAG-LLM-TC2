@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.security import HTTPBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
@@ -25,17 +25,28 @@ from ..shared.monitoring import metric_collector, alert_manager, health_checker,
 from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
 from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
 
-# Authentication dependency functions
-get_current_user = auth_middleware.get_current_user
-get_current_user_optional = auth_middleware.get_current_user_optional
-validate_token = auth_middleware.validate_token_endpoint
-require_permissions = auth_middleware.require_permissions
-
 # Set up structured logging
 logger = StructuredLogger(__name__)
 
 # Security
 security = HTTPBearer()
+
+# Authentication dependency functions
+async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> UserSession:
+    """Get current authenticated user."""
+    return await auth_middleware.get_current_user(credentials)
+
+async def get_current_user_optional(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[UserSession]:
+    """Get current authenticated user (optional)."""
+    return await auth_middleware.get_current_user_optional(credentials)
+
+async def validate_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    """Validate token endpoint."""
+    return await auth_middleware.validate_token_endpoint(credentials)
+
+def require_permissions(*permissions: str):
+    """Require specific permissions."""
+    return auth_middleware.require_permissions(*permissions)
 
 
 class RequestLoggingMiddleware:
@@ -812,7 +823,394 @@ async def get_cache_performance_metrics(
         )
 
 
-# Authentication endpoints are now imported at the top
+# Authentication and API endpoints
+
+@app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
+async def login(
+    request: Request,
+    login_data: LoginRequest,
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 300))  # 5 attempts per 5 minutes
+):
+    """
+    Authenticate user and create session.
+    
+    Args:
+        request: FastAPI request object
+        login_data: Login credentials
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        LoginResponse: Authentication token and user info
+    
+    Raises:
+        HTTPException: If authentication fails
+    """
+    try:
+        # Authenticate user
+        auth_result = auth_manager.authenticate_user(
+            username=login_data.username,
+            password=login_data.password
+        )
+        
+        logger.info(f"User {login_data.username} logged in successfully")
+        
+        return LoginResponse(
+            access_token=auth_result["access_token"],
+            token_type=auth_result["token_type"],
+            user_id=auth_result["user_id"],
+            groups=auth_result["groups"]
+        )
+    
+    except InvalidCredentialsError:
+        logger.warning(f"Invalid login attempt for user {login_data.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    except AuthenticationError as e:
+        logger.error(f"Authentication error for user {login_data.username}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service error"
+        )
+    
+    except Exception as e:
+        logger.error(f"Unexpected login error for user {login_data.username}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login service temporarily unavailable"
+        )
+
+
+@app.post("/api/auth/logout", tags=["Authentication"])
+async def logout(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Logout user and invalidate session.
+    
+    Args:
+        request: FastAPI request object
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Logout confirmation
+    """
+    try:
+        # Get token from request headers
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authorization header"
+            )
+        
+        token = auth_header.split(" ")[1]
+        
+        # Logout user
+        success = auth_manager.logout_user(token)
+        
+        if success:
+            logger.info(f"User {current_user.user_id} logged out successfully")
+            return {"message": "Logged out successfully"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Logout failed"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Logout error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Logout service error"
+        )
+
+
+# Removed duplicate session endpoint - using the more complete one below
+
+
+# Document management endpoints
+@app.post("/api/documents/upload", tags=["Documents"])
+async def upload_documents(
+    files: list = [],
+    group_id: str = "personal",
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Upload documents for processing.
+    
+    Args:
+        files: List of uploaded files
+        group_id: Group to upload documents to
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Upload result
+    """
+    try:
+        # For now, return a mock response
+        # In a real implementation, this would process the files
+        return {
+            "message": "Files uploaded successfully",
+            "files_count": len(files),
+            "group_id": group_id,
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Upload error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Upload service error"
+        )
+
+
+@app.get("/api/documents", tags=["Documents"])
+async def list_documents(
+    group_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's documents.
+    
+    Args:
+        group_id: Filter by group ID
+        status: Filter by processing status
+        limit: Maximum number of documents to return
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of documents
+    """
+    try:
+        # For now, return mock data
+        # In a real implementation, this would query the database
+        mock_documents = [
+            {
+                "document_id": "doc1",
+                "filename": "sample1.pdf",
+                "group_id": "personal",
+                "file_size": 1024000,
+                "upload_date": "2024-01-01T10:00:00Z",
+                "processing_status": "completed"
+            },
+            {
+                "document_id": "doc2", 
+                "filename": "sample2.pdf",
+                "group_id": "personal",
+                "file_size": 2048000,
+                "upload_date": "2024-01-01T11:00:00Z",
+                "processing_status": "processing"
+            }
+        ]
+        
+        return {
+            "documents": mock_documents,
+            "total": len(mock_documents),
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Document list error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document service error"
+        )
+
+
+@app.delete("/api/documents/{document_id}", tags=["Documents"])
+async def delete_document(
+    document_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Delete a document.
+    
+    Args:
+        document_id: ID of document to delete
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Deletion result
+    """
+    try:
+        # For now, return success
+        # In a real implementation, this would delete from database
+        return {
+            "message": "Document deleted successfully",
+            "document_id": document_id,
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Document delete error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document delete service error"
+        )
+
+
+# Query endpoints
+@app.post("/api/query", tags=["Query"])
+async def submit_query(
+    query_data: dict,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Submit a query for processing.
+    
+    Args:
+        query_data: Query data containing query_text
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Query submission result
+    """
+    try:
+        query_text = query_data.get("query_text", "")
+        if not query_text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Query text is required"
+            )
+        
+        # For now, return mock response
+        # In a real implementation, this would submit to Celery
+        query_id = f"query_{int(time.time())}"
+        
+        return {
+            "query_id": query_id,
+            "status": "processing",
+            "message": "Query submitted for processing",
+            "user_id": current_user.user_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Query submit error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query service error"
+        )
+
+
+@app.get("/api/query/{query_id}", tags=["Query"])
+async def get_query_result(
+    query_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get query result.
+    
+    Args:
+        query_id: ID of the query
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Query result
+    """
+    try:
+        # For now, return mock result
+        # In a real implementation, this would check job status
+        return {
+            "query_id": query_id,
+            "status": "completed",
+            "result": "This is a mock response to your query. In a real implementation, this would contain the actual RAG response with citations.",
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Query result error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query result service error"
+        )
+
+
+# Job management endpoints
+@app.get("/api/jobs", tags=["Jobs"])
+async def list_jobs(
+    status: Optional[str] = None,
+    limit: int = 50,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's jobs.
+    
+    Args:
+        status: Filter by job status
+        limit: Maximum number of jobs to return
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of jobs
+    """
+    try:
+        # For now, return mock data
+        # In a real implementation, this would query the job manager
+        mock_jobs = [
+            {
+                "job_id": "job1",
+                "job_type": "embedding",
+                "status": "completed",
+                "progress": 1.0,
+                "created_at": "2024-01-01T10:00:00Z"
+            },
+            {
+                "job_id": "job2",
+                "job_type": "query", 
+                "status": "processing",
+                "progress": 0.5,
+                "created_at": "2024-01-01T11:00:00Z"
+            }
+        ]
+        
+        return {
+            "jobs": mock_jobs,
+            "total": len(mock_jobs),
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Jobs list error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Jobs service error"
+        )
+
+
+@app.delete("/api/jobs/{job_id}", tags=["Jobs"])
+async def cancel_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Cancel a job.
+    
+    Args:
+        job_id: ID of job to cancel
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Cancellation result
+    """
+    try:
+        # For now, return success
+        # In a real implementation, this would cancel the Celery job
+        return {
+            "message": "Job cancelled successfully",
+            "job_id": job_id,
+            "user_id": current_user.user_id
+        }
+    except Exception as e:
+        logger.error(f"Job cancel error for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job cancel service error"
+        )
 
 
 @app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])

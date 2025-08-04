@@ -12,15 +12,20 @@ class RAGApp {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 1000;
-        
+        this.selectedFiles = [];
+
         this.init();
     }
 
     async init() {
+        console.log('RAGApp initializing...');
+        console.log('Token:', this.token);
+
         this.setupEventListeners();
-        
+
         // Check if user is already logged in
         if (this.token) {
+            console.log('Token found, validating session...');
             try {
                 await this.validateSession();
                 this.showMainApp();
@@ -30,6 +35,7 @@ class RAGApp {
                 this.logout();
             }
         } else {
+            console.log('No token found, showing login...');
             this.showLogin();
         }
     }
@@ -97,7 +103,7 @@ class RAGApp {
         uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
             uploadArea.classList.remove('dragover');
-            const files = Array.from(e.dataTransfer.files).filter(file => 
+            const files = Array.from(e.dataTransfer.files).filter(file =>
                 file.type === 'application/pdf'
             );
             this.handleFileSelection(files);
@@ -120,12 +126,12 @@ class RAGApp {
 
         const fileList = document.getElementById('fileList');
         const selectedFiles = document.getElementById('selectedFiles');
-        
+
         if (!fileList || !selectedFiles) return;
 
         // Clear previous selection
         selectedFiles.innerHTML = '';
-        
+
         // Store files for upload
         this.selectedFiles = files;
 
@@ -145,12 +151,12 @@ class RAGApp {
                     <i class="fas fa-times"></i>
                 </button>
             `;
-            
+
             const removeBtn = fileItem.querySelector('.remove-file');
             removeBtn.addEventListener('click', () => {
                 this.removeFile(index);
             });
-            
+
             selectedFiles.appendChild(fileItem);
         });
 
@@ -159,7 +165,7 @@ class RAGApp {
 
     removeFile(index) {
         this.selectedFiles.splice(index, 1);
-        
+
         if (this.selectedFiles.length === 0) {
             document.getElementById('fileList').style.display = 'none';
         } else {
@@ -169,7 +175,7 @@ class RAGApp {
 
     async handleFileUpload() {
         const groupSelect = document.getElementById('groupSelect');
-        const groupId = groupSelect.value;
+        const groupId = groupSelect ? groupSelect.value : '';
 
         if (!groupId) {
             this.showToast('error', 'Error', 'Please select a group');
@@ -186,8 +192,8 @@ class RAGApp {
         const progressText = document.getElementById('progressText');
         const uploadBtn = document.getElementById('uploadBtn');
 
-        uploadProgress.style.display = 'block';
-        uploadBtn.disabled = true;
+        if (uploadProgress) uploadProgress.style.display = 'block';
+        if (uploadBtn) uploadBtn.disabled = true;
 
         try {
             const formData = new FormData();
@@ -210,22 +216,22 @@ class RAGApp {
             }
 
             const result = await response.json();
-            
+
             // Simulate progress (real progress would come from WebSocket)
             let progress = 0;
             const progressInterval = setInterval(() => {
                 progress += 10;
-                progressFill.style.width = `${progress}%`;
-                progressText.textContent = `${progress}%`;
-                
+                if (progressFill) progressFill.style.width = `${progress}%`;
+                if (progressText) progressText.textContent = `${progress}%`;
+
                 if (progress >= 100) {
                     clearInterval(progressInterval);
-                    this.showToast('success', 'Upload Complete', 
-                        `Successfully uploaded ${result.files_count} files`);
-                    
+                    this.showToast('success', 'Upload Complete',
+                        `Successfully uploaded ${result.files_count || this.selectedFiles.length} files`);
+
                     // Reset form
                     this.resetUploadForm();
-                    
+
                     // Refresh documents and jobs
                     this.loadDocuments();
                     this.loadJobs();
@@ -235,22 +241,27 @@ class RAGApp {
         } catch (error) {
             console.error('Upload error:', error);
             this.showToast('error', 'Upload Failed', error.message);
-            uploadProgress.style.display = 'none';
-            uploadBtn.disabled = false;
+            if (uploadProgress) uploadProgress.style.display = 'none';
+            if (uploadBtn) uploadBtn.disabled = false;
         }
     }
 
     resetUploadForm() {
-        document.getElementById('fileList').style.display = 'none';
-        document.getElementById('uploadProgress').style.display = 'none';
-        document.getElementById('fileInput').value = '';
-        document.getElementById('uploadBtn').disabled = false;
+        const fileList = document.getElementById('fileList');
+        const uploadProgress = document.getElementById('uploadProgress');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+
+        if (fileList) fileList.style.display = 'none';
+        if (uploadProgress) uploadProgress.style.display = 'none';
+        if (fileInput) fileInput.value = '';
+        if (uploadBtn) uploadBtn.disabled = false;
         this.selectedFiles = [];
     }
 
     async handleQuery() {
         const queryInput = document.getElementById('queryInput');
-        const queryText = queryInput.value.trim();
+        const queryText = queryInput ? queryInput.value.trim() : '';
 
         if (!queryText) {
             this.showToast('error', 'Error', 'Please enter a query');
@@ -262,10 +273,10 @@ class RAGApp {
         const queryResponse = document.getElementById('queryResponse');
         const queryStatus = document.getElementById('queryStatus');
 
-        submitBtn.disabled = true;
-        queryResults.style.display = 'block';
-        queryResponse.innerHTML = '<div class="loading"><i class="fas fa-spinner fa-spin"></i>Processing your query...</div>';
-        queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Processing';
+        if (submitBtn) submitBtn.disabled = true;
+        if (queryResults) queryResults.style.display = 'block';
+        if (queryResponse) queryResponse.innerHTML = '<div class="loading"><i class="fas fa-spinner fa-spin"></i>Processing your query...</div>';
+        if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Processing';
 
         try {
             const response = await fetch(`${this.apiBase}/query`, {
@@ -283,15 +294,15 @@ class RAGApp {
             }
 
             const result = await response.json();
-            
+
             // Poll for results (real updates would come from WebSocket)
             this.pollQueryResult(result.query_id);
 
         } catch (error) {
             console.error('Query error:', error);
-            queryResponse.innerHTML = `<div class="error-message">Query failed: ${error.message}</div>`;
-            queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
-            submitBtn.disabled = false;
+            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${error.message}</div>`;
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
+            if (submitBtn) submitBtn.disabled = false;
         }
     }
 
@@ -317,32 +328,32 @@ class RAGApp {
                 const submitBtn = document.getElementById('submitQueryBtn');
 
                 if (result.status === 'completed') {
-                    queryResponse.innerHTML = result.result || 'No results found';
-                    queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
-                    submitBtn.disabled = false;
+                    if (queryResponse) queryResponse.innerHTML = result.result || 'No results found';
+                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
+                    if (submitBtn) submitBtn.disabled = false;
                     return;
                 } else if (result.status === 'failed') {
-                    queryResponse.innerHTML = `<div class="error-message">Query failed: ${result.error || 'Unknown error'}</div>`;
-                    queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
-                    submitBtn.disabled = false;
+                    if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${result.error || 'Unknown error'}</div>`;
+                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
+                    if (submitBtn) submitBtn.disabled = false;
                     return;
                 } else if (attempts < maxAttempts) {
                     attempts++;
                     setTimeout(poll, 1000);
                 } else {
-                    queryResponse.innerHTML = '<div class="error-message">Query timeout</div>';
-                    queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Timeout';
-                    submitBtn.disabled = false;
+                    if (queryResponse) queryResponse.innerHTML = '<div class="error-message">Query timeout</div>';
+                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Timeout';
+                    if (submitBtn) submitBtn.disabled = false;
                 }
             } catch (error) {
                 console.error('Polling error:', error);
                 const queryResponse = document.getElementById('queryResponse');
                 const queryStatus = document.getElementById('queryStatus');
                 const submitBtn = document.getElementById('submitQueryBtn');
-                
-                queryResponse.innerHTML = `<div class="error-message">Error checking query status: ${error.message}</div>`;
-                queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Error';
-                submitBtn.disabled = false;
+
+                if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Error checking query status: ${error.message}</div>`;
+                if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Error';
+                if (submitBtn) submitBtn.disabled = false;
             }
         };
 
@@ -351,19 +362,36 @@ class RAGApp {
 
     async handleLogin(e) {
         e.preventDefault();
-        
-        const username = document.getElementById('username').value;
-        const password = document.getElementById('password').value;
+
+        const username = document.getElementById('username');
+        const password = document.getElementById('password');
         const loginError = document.getElementById('loginError');
 
+        if (!username || !password) {
+            console.error('Username or password input not found');
+            return;
+        }
+
+        const usernameValue = username.value;
+        const passwordValue = password.value;
+
+        if (loginError) loginError.style.display = 'none';
+
         try {
+            console.log('Attempting login for user:', usernameValue);
+
             const response = await fetch(`${this.apiBase}/auth/login`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ username, password })
+                body: JSON.stringify({ 
+                    username: usernameValue, 
+                    password: passwordValue 
+                })
             });
+
+            console.log('Login response status:', response.status);
 
             if (!response.ok) {
                 const error = await response.json();
@@ -371,6 +399,8 @@ class RAGApp {
             }
 
             const result = await response.json();
+            console.log('Login successful:', result);
+
             this.token = result.access_token;
             this.user = {
                 user_id: result.user_id,
@@ -378,14 +408,18 @@ class RAGApp {
             };
 
             localStorage.setItem('auth_token', this.token);
-            
+
             this.showMainApp();
             this.connectWebSocket();
-            
+
         } catch (error) {
             console.error('Login error:', error);
-            loginError.textContent = error.message;
-            loginError.style.display = 'block';
+            if (loginError) {
+                loginError.textContent = error.message;
+                loginError.style.display = 'block';
+            } else {
+                alert('Login failed: ' + error.message);
+            }
         }
     }
 
@@ -406,12 +440,12 @@ class RAGApp {
         this.token = null;
         this.user = null;
         localStorage.removeItem('auth_token');
-        
+
         if (this.websocket) {
             this.websocket.close();
             this.websocket = null;
         }
-        
+
         this.showLogin();
     }
 
@@ -434,26 +468,53 @@ class RAGApp {
     }
 
     showLogin() {
-        document.getElementById('loginForm').style.display = 'flex';
-        document.getElementById('mainApp').style.display = 'none';
-        document.getElementById('userInfo').style.display = 'none';
+        console.log('showLogin() called');
+        const loginForm = document.getElementById('loginForm');
+        const mainApp = document.getElementById('mainApp');
+        const userInfo = document.getElementById('userInfo');
+
+        console.log('loginForm element:', loginForm);
+        console.log('mainApp element:', mainApp);
+        console.log('userInfo element:', userInfo);
+
+        if (loginForm) {
+            loginForm.style.display = 'flex';
+            console.log('Login form display set to flex');
+        }
+        if (mainApp) {
+            mainApp.style.display = 'none';
+            console.log('Main app display set to none');
+        }
+        if (userInfo) {
+            userInfo.style.display = 'none';
+            console.log('User info display set to none');
+        }
+
+        console.log('Login form should now be visible');
     }
 
     showMainApp() {
-        document.getElementById('loginForm').style.display = 'none';
-        document.getElementById('mainApp').style.display = 'block';
-        document.getElementById('userInfo').style.display = 'flex';
-        document.getElementById('userName').textContent = this.user.user_id;
-        
+        const loginForm = document.getElementById('loginForm');
+        const mainApp = document.getElementById('mainApp');
+        const userInfo = document.getElementById('userInfo');
+        const userName = document.getElementById('userName');
+
+        if (loginForm) loginForm.style.display = 'none';
+        if (mainApp) mainApp.style.display = 'block';
+        if (userInfo) userInfo.style.display = 'flex';
+        if (userName && this.user) userName.textContent = this.user.user_id;
+
         this.populateGroupSelects();
         this.loadDocuments();
         this.loadJobs();
     }
 
     populateGroupSelects() {
+        if (!this.user || !this.user.groups) return;
+
         const groupSelect = document.getElementById('groupSelect');
         const groupFilter = document.getElementById('groupFilter');
-        
+
         if (groupSelect) {
             groupSelect.innerHTML = '<option value="">Select a group...</option>';
             this.user.groups.forEach(group => {
@@ -463,7 +524,7 @@ class RAGApp {
                 groupSelect.appendChild(option);
             });
         }
-        
+
         if (groupFilter) {
             groupFilter.innerHTML = '<option value="">All Groups</option>';
             this.user.groups.forEach(group => {
@@ -480,13 +541,15 @@ class RAGApp {
         document.querySelectorAll('.nav-tab').forEach(tab => {
             tab.classList.remove('active');
         });
-        document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+        const activeTab = document.querySelector(`[data-tab="${tabName}"]`);
+        if (activeTab) activeTab.classList.add('active');
 
         // Update tab content
         document.querySelectorAll('.tab-pane').forEach(pane => {
             pane.classList.remove('active');
         });
-        document.getElementById(`${tabName}Tab`).classList.add('active');
+        const activePane = document.getElementById(`${tabName}Tab`);
+        if (activePane) activePane.classList.add('active');
 
         // Load data for specific tabs
         if (tabName === 'documents') {
@@ -502,8 +565,8 @@ class RAGApp {
         const groupFilter = document.getElementById('groupFilter');
         const statusFilter = document.getElementById('statusFilter');
 
-        documentsLoading.style.display = 'flex';
-        documentsGrid.innerHTML = '';
+        if (documentsLoading) documentsLoading.style.display = 'flex';
+        if (documentsGrid) documentsGrid.innerHTML = '';
 
         try {
             const params = new URLSearchParams();
@@ -522,19 +585,22 @@ class RAGApp {
             }
 
             const result = await response.json();
-            this.displayDocuments(result.documents);
+            this.displayDocuments(result.documents || []);
 
         } catch (error) {
             console.error('Error loading documents:', error);
-            documentsGrid.innerHTML = `<div class="error-message">Failed to load documents: ${error.message}</div>`;
+            if (documentsGrid) {
+                documentsGrid.innerHTML = `<div class="error-message">Failed to load documents: ${error.message}</div>`;
+            }
         } finally {
-            documentsLoading.style.display = 'none';
+            if (documentsLoading) documentsLoading.style.display = 'none';
         }
     }
 
     displayDocuments(documents) {
         const documentsGrid = document.getElementById('documentsGrid');
-        
+        if (!documentsGrid) return;
+
         if (documents.length === 0) {
             documentsGrid.innerHTML = '<div class="loading">No documents found</div>';
             return;
@@ -544,26 +610,26 @@ class RAGApp {
             <div class="document-card">
                 <div class="document-header">
                     <i class="fas fa-file-pdf document-icon"></i>
-                    <div class="document-title">${doc.filename}</div>
+                    <div class="document-title">${doc.filename || 'Unknown'}</div>
                 </div>
                 <div class="document-meta">
                     <div class="document-meta-item">
                         <span>Group:</span>
-                        <span>${doc.group_id}</span>
+                        <span>${doc.group_id || 'Unknown'}</span>
                     </div>
                     <div class="document-meta-item">
                         <span>Size:</span>
-                        <span>${this.formatFileSize(doc.file_size)}</span>
+                        <span>${this.formatFileSize(doc.file_size || 0)}</span>
                     </div>
                     <div class="document-meta-item">
                         <span>Uploaded:</span>
-                        <span>${this.formatDate(doc.upload_date)}</span>
+                        <span>${this.formatDate(doc.upload_date || new Date())}</span>
                     </div>
                     <div class="document-meta-item">
                         <span>Status:</span>
-                        <span class="document-status status-${doc.processing_status}">
-                            ${this.getStatusIcon(doc.processing_status)}
-                            ${doc.processing_status}
+                        <span class="document-status status-${doc.processing_status || 'unknown'}">
+                            ${this.getStatusIcon(doc.processing_status || 'unknown')}
+                            ${doc.processing_status || 'unknown'}
                         </span>
                     </div>
                 </div>
@@ -611,8 +677,8 @@ class RAGApp {
         const completedJobs = document.getElementById('completedJobs');
         const failedJobs = document.getElementById('failedJobs');
 
-        jobsLoading.style.display = 'flex';
-        jobsList.innerHTML = '';
+        if (jobsLoading) jobsLoading.style.display = 'flex';
+        if (jobsList) jobsList.innerHTML = '';
 
         try {
             const response = await fetch(`${this.apiBase}/jobs`, {
@@ -626,19 +692,22 @@ class RAGApp {
             }
 
             const result = await response.json();
-            this.displayJobs(result.jobs);
-            
+            const jobs = result.jobs || [];
+            this.displayJobs(jobs);
+
             // Update summary
-            const stats = this.calculateJobStats(result.jobs);
-            activeJobs.textContent = stats.active;
-            completedJobs.textContent = stats.completed;
-            failedJobs.textContent = stats.failed;
+            const stats = this.calculateJobStats(jobs);
+            if (activeJobs) activeJobs.textContent = stats.active;
+            if (completedJobs) completedJobs.textContent = stats.completed;
+            if (failedJobs) failedJobs.textContent = stats.failed;
 
         } catch (error) {
             console.error('Error loading jobs:', error);
-            jobsList.innerHTML = `<div class="error-message">Failed to load jobs: ${error.message}</div>`;
+            if (jobsList) {
+                jobsList.innerHTML = `<div class="error-message">Failed to load jobs: ${error.message}</div>`;
+            }
         } finally {
-            jobsLoading.style.display = 'none';
+            if (jobsLoading) jobsLoading.style.display = 'none';
         }
     }
 
@@ -657,7 +726,8 @@ class RAGApp {
 
     displayJobs(jobs) {
         const jobsList = document.getElementById('jobsList');
-        
+        if (!jobsList) return;
+
         if (jobs.length === 0) {
             jobsList.innerHTML = '<div class="loading">No jobs found</div>';
             return;
@@ -674,9 +744,9 @@ class RAGApp {
                 </div>
                 <div class="job-progress">
                     <div class="job-progress-bar">
-                        <div class="job-progress-fill" style="width: ${job.progress * 100}%"></div>
+                        <div class="job-progress-fill" style="width: ${(job.progress || 0) * 100}%"></div>
                     </div>
-                    <div class="job-progress-text">${Math.round(job.progress * 100)}% complete</div>
+                    <div class="job-progress-text">${Math.round((job.progress || 0) * 100)}% complete</div>
                 </div>
                 <div class="job-details">
                     <div class="job-info">
@@ -686,12 +756,12 @@ class RAGApp {
                         </span>
                     </div>
                     <div class="job-actions">
-                        ${job.status === 'processing' || job.status === 'pending' ? 
-                            `<button class="btn btn-danger btn-small" onclick="app.cancelJob('${job.job_id}')">
+                        ${job.status === 'processing' || job.status === 'pending' ?
+                `<button class="btn btn-danger btn-small" onclick="app.cancelJob('${job.job_id}')">
                                 <i class="fas fa-stop"></i>
                                 Cancel
                             </button>` : ''
-                        }
+            }
                     </div>
                 </div>
             </div>
@@ -734,12 +804,12 @@ class RAGApp {
             // Add token as query parameter
             const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.token)}`;
             this.websocket = new WebSocket(wsUrlWithToken);
-            
+
             this.websocket.onopen = () => {
                 console.log('WebSocket connected');
                 this.reconnectAttempts = 0;
                 this.updateConnectionStatus('connected');
-                
+
                 // Start heartbeat
                 this.startHeartbeat();
             };
@@ -775,7 +845,7 @@ class RAGApp {
         if (this.reconnectAttempts < this.maxReconnectAttempts && this.token) {
             this.reconnectAttempts++;
             this.updateConnectionStatus('connecting');
-            
+
             setTimeout(() => {
                 console.log(`Reconnecting WebSocket (attempt ${this.reconnectAttempts})`);
                 this.connectWebSocket();
@@ -785,7 +855,7 @@ class RAGApp {
 
     handleWebSocketMessage(message) {
         console.log('WebSocket message:', message);
-        
+
         switch (message.type) {
             case 'job_update':
                 this.handleJobUpdate(message.data);
@@ -809,169 +879,84 @@ class RAGApp {
             const progressFill = jobCard.querySelector('.job-progress-fill');
             const progressText = jobCard.querySelector('.job-progress-text');
             const statusElement = jobCard.querySelector('.document-status');
-            
+
             if (progressFill) {
-                progressFill.style.width = `${jobData.progress * 100}%`;
+                progressFill.style.width = `${(jobData.progress || 0) * 100}%`;
             }
             if (progressText) {
-                progressText.textContent = `${Math.round(jobData.progress * 100)}% complete`;
+                progressText.textContent = `${Math.round((jobData.progress || 0) * 100)}% complete`;
             }
             if (statusElement) {
                 statusElement.className = `document-status status-${jobData.status}`;
                 statusElement.innerHTML = `${this.getStatusIcon(jobData.status)} ${jobData.status}`;
             }
         }
-        
-        // Refresh relevant tabs
-        const activeTab = document.querySelector('.nav-tab.active').dataset.tab;
-        if (activeTab === 'jobs') {
-            this.loadJobs();
-        } else if (activeTab === 'documents' && jobData.job_type === 'embedding') {
-            this.loadDocuments();
-        }
-        
-        // Show notification for completed jobs
-        if (jobData.status === 'completed') {
-            this.showToast('success', 'Job Completed', 
-                `${jobData.job_type} job completed successfully`);
-        } else if (jobData.status === 'failed') {
-            this.showToast('error', 'Job Failed', 
-                `${jobData.job_type} job failed: ${jobData.error || 'Unknown error'}`);
-        }
     }
 
     startHeartbeat() {
-        // Clear existing heartbeat
+        // Send periodic heartbeat to keep connection alive
         if (this.heartbeatInterval) {
             clearInterval(this.heartbeatInterval);
         }
         
-        // Send ping every 30 seconds
         this.heartbeatInterval = setInterval(() => {
             if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                this.websocket.send(JSON.stringify({
-                    type: 'ping',
-                    timestamp: Date.now()
-                }));
+                this.websocket.send(JSON.stringify({ type: 'heartbeat' }));
             }
-        }, 30000);
+        }, 30000); // Every 30 seconds
     }
-
-    stopHeartbeat() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
-    }L = `${this.getStatusIcon(jobData.status)} ${jobData.status}`;
-            }
-        }
-        
-        // Refresh relevant tabs
-        const activeTab = document.querySelector('.nav-tab.active').dataset.tab;
-        if (activeTab === 'jobs') {
-            this.loadJobs();
-        } else if (activeTab === 'documents' && jobData.job_type === 'embedding') {
-            this.loadDocuments();
-        }
-        
-        // Show notification for completed jobs
-        if (jobData.status === 'completed') {
-            this.showToast('success', 'Job Completed', 
-                `${jobData.job_type} job completed successfully`);
-        } else if (jobData.status === 'failed') {
-            this.showToast('error', 'Job Failed', 
-                `${jobData.job_type} job failed: ${jobData.error || 'Unknown error'}`);
-        }
-    }
-
-    startHeartbeat() {
-        // Clear existing heartbeat
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-        
-        // Send ping every 30 seconds
-        this.heartbeatInterval = setInterval(() => {
-            if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                this.websocket.send(JSON.stringify({
-                    type: 'ping',
-                    timestamp: Date.now()
-                }));
-            }
-        }, 30000);
-    }
-
-    stopHeartbeat() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }L = `${this.getStatusIcon(jobData.status)} ${jobData.status}`;
-            }
-        }
-        
-        // Refresh relevant tabs
-        const activeTab = document.querySelector('.nav-tab.active').dataset.tab;
-        if (activeTab === 'jobs') {
-            this.loadJobs();
-        } else if (activeTab === 'documents' && jobData.job_type === 'embedding') {
-            this.loadDocuments();
-        }
-        
-        // Show notification for completed jobs
-        if (jobData.status === 'completed') {
-            this.showToast('success', 'Job Completed', 
-                `${jobData.job_type} job completed successfully`);
-        } else if (jobData.status === 'failed') {
-            this.showToast('error', 'Job Failed', 
-                `${jobData.job_type} job failed: ${jobData.error || 'Unknown error'}`);
-        }
-    }
-
 
     updateConnectionStatus(status) {
         const connectionStatus = document.getElementById('connectionStatus');
         const connectionText = document.getElementById('connectionText');
-        
-        connectionStatus.className = `connection-status ${status}`;
-        
-        switch (status) {
-            case 'connected':
-                connectionText.textContent = 'Connected';
-                break;
-            case 'connecting':
-                connectionText.textContent = 'Connecting...';
-                break;
-            case 'disconnected':
-                connectionText.textContent = 'Disconnected';
-                break;
+
+        if (connectionStatus && connectionText) {
+            connectionStatus.className = `connection-status ${status}`;
+
+            switch (status) {
+                case 'connected':
+                    connectionText.textContent = 'Connected';
+                    break;
+                case 'connecting':
+                    connectionText.textContent = 'Connecting...';
+                    break;
+                case 'disconnected':
+                    connectionText.textContent = 'Disconnected';
+                    break;
+                default:
+                    connectionText.textContent = 'Unknown';
+            }
         }
     }
 
-    showToast(type, title, message) {
+    showToast(level, title, message) {
         const toastContainer = document.getElementById('toastContainer');
+        if (!toastContainer) {
+            // If no toast container, fall back to console and alert
+            console.log(`${level.toUpperCase()}: ${title} - ${message}`);
+            if (level === 'error') {
+                alert(`Error: ${message}`);
+            }
+            return;
+        }
+
         const toast = document.createElement('div');
-        toast.className = `toast ${type}`;
-        
+        toast.className = `toast toast-${level}`;
         toast.innerHTML = `
-            <div class="toast-content">
-                <div class="toast-title">${title}</div>
-                <div class="toast-message">${message}</div>
+            <div class="toast-header">
+                <strong>${title}</strong>
+                <button class="toast-close" onclick="this.parentElement.parentElement.remove()">
+                    <i class="fas fa-times"></i>
+                </button>
             </div>
-            <button class="toast-close">
-                <i class="fas fa-times"></i>
-            </button>
+            <div class="toast-body">${message}</div>
         `;
-        
-        const closeBtn = toast.querySelector('.toast-close');
-        closeBtn.addEventListener('click', () => {
-            toast.remove();
-        });
-        
+
         toastContainer.appendChild(toast);
-        
+
         // Auto-remove after 5 seconds
         setTimeout(() => {
-            if (toast.parentNode) {
+            if (toast.parentElement) {
                 toast.remove();
             }
         }, 5000);
@@ -987,8 +972,12 @@ class RAGApp {
     }
 
     formatDate(dateString) {
-        const date = new Date(dateString);
-        return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+        try {
+            const date = new Date(dateString);
+            return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+        } catch (error) {
+            return 'Invalid Date';
+        }
     }
 
     getStatusIcon(status) {
@@ -1019,145 +1008,6 @@ class RAGApp {
 
 // Initialize the application when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    window.app = new RAGApp();
-});L
- = `${this.getStatusIcon(jobData.status)} ${jobData.status}`;
-            }
-        }
-        
-        // Refresh relevant tabs
-        const activeTab = document.querySelector('.nav-tab.active').dataset.tab;
-        if (activeTab === 'jobs') {
-            this.loadJobs();
-        } else if (activeTab === 'documents' && jobData.job_type === 'embedding') {
-            this.loadDocuments();
-        }
-        
-        // Show notification for completed jobs
-        if (jobData.status === 'completed') {
-            this.showToast('success', 'Job Completed', 
-                `${jobData.job_type} job completed successfully`);
-        } else if (jobData.status === 'failed') {
-            this.showToast('error', 'Job Failed', 
-                `${jobData.job_type} job failed: ${jobData.error || 'Unknown error'}`);
-        }
-    }
-
-    startHeartbeat() {
-        // Clear existing heartbeat
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-        
-        // Send ping every 30 seconds
-        this.heartbeatInterval = setInterval(() => {
-            if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                this.websocket.send(JSON.stringify({
-                    type: 'ping',
-                    timestamp: Date.now()
-                }));
-            }
-        }, 30000);
-    }
-
-    stopHeartbeat() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
-    }
-
-    updateConnectionStatus(status) {
-        const connectionStatus = document.getElementById('connectionStatus');
-        const connectionText = document.getElementById('connectionText');
-        
-        connectionStatus.className = `connection-status ${status}`;
-        
-        switch (status) {
-            case 'connected':
-                connectionText.textContent = 'Connected';
-                break;
-            case 'connecting':
-                connectionText.textContent = 'Connecting...';
-                break;
-            case 'disconnected':
-                connectionText.textContent = 'Disconnected';
-                this.stopHeartbeat();
-                break;
-        }
-    }
-
-    showToast(type, title, message) {
-        const toastContainer = document.getElementById('toastContainer');
-        const toast = document.createElement('div');
-        toast.className = `toast ${type}`;
-        
-        toast.innerHTML = `
-            <div class="toast-content">
-                <div class="toast-title">${title}</div>
-                <div class="toast-message">${message}</div>
-            </div>
-            <button class="toast-close">
-                <i class="fas fa-times"></i>
-            </button>
-        `;
-        
-        const closeBtn = toast.querySelector('.toast-close');
-        closeBtn.addEventListener('click', () => {
-            toast.remove();
-        });
-        
-        toastContainer.appendChild(toast);
-        
-        // Auto-remove after 5 seconds
-        setTimeout(() => {
-            if (toast.parentNode) {
-                toast.remove();
-            }
-        }, 5000);
-    }
-
-    // Utility functions
-    formatFileSize(bytes) {
-        if (bytes === 0) return '0 Bytes';
-        const k = 1024;
-        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }
-
-    formatDate(dateString) {
-        const date = new Date(dateString);
-        return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
-    }
-
-    getStatusIcon(status) {
-        switch (status) {
-            case 'processing':
-            case 'pending':
-                return '<i class="fas fa-spinner fa-spin"></i>';
-            case 'completed':
-                return '<i class="fas fa-check-circle"></i>';
-            case 'failed':
-                return '<i class="fas fa-exclamation-circle"></i>';
-            default:
-                return '<i class="fas fa-question-circle"></i>';
-        }
-    }
-
-    getJobIcon(jobType) {
-        switch (jobType) {
-            case 'embedding':
-                return '<i class="fas fa-file-upload"></i>';
-            case 'query':
-                return '<i class="fas fa-search"></i>';
-            default:
-                return '<i class="fas fa-cog"></i>';
-        }
-    }
-}
-
-// Initialize the application when DOM is loaded
-document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOM loaded, initializing RAGApp...');
     window.app = new RAGApp();
 });
