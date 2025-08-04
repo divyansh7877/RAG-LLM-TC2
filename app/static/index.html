@@ -90,8 +90,9 @@
                         <div class="upload-area" id="uploadArea">
                             <div class="upload-content">
                                 <i class="fas fa-cloud-upload-alt upload-icon"></i>
-                                <p>Drag and drop PDF files here or click to browse</p>
-                                <input type="file" id="fileInput" multiple accept=".pdf" style="display: none;">
+                                <p>Drag and drop documents here or click to browse<br>
+                                <small>Supported formats: PDF, DOCX, PPTX, XLSX, HTML, MD, CSV</small></p>
+                                <input type="file" id="fileInput" multiple accept=".pdf,.docx,.pptx,.xlsx,.xls,.html,.md,.csv" style="display: none;">
                                 <button type="button" class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
                                     <i class="fas fa-folder-open"></i>
                                     Browse Files

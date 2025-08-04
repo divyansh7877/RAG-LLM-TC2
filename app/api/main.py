@@ -935,39 +935,7 @@ async def logout(
 # Removed duplicate session endpoint - using the more complete one below
 
 
-# Document management endpoints
-@app.post("/api/documents/upload", tags=["Documents"])
-async def upload_documents(
-    files: list = [],
-    group_id: str = "personal",
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Upload documents for processing.
-    
-    Args:
-        files: List of uploaded files
-        group_id: Group to upload documents to
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Upload result
-    """
-    try:
-        # For now, return a mock response
-        # In a real implementation, this would process the files
-        return {
-            "message": "Files uploaded successfully",
-            "files_count": len(files),
-            "group_id": group_id,
-            "user_id": current_user.user_id
-        }
-    except Exception as e:
-        logger.error(f"Upload error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Upload service error"
-        )
+# Document management endpoints - using complete implementation below
 
 
 @app.get("/api/documents", tags=["Documents"])
@@ -1516,11 +1484,14 @@ async def upload_documents(
         
         # Process and validate each file
         for file in files:
-            # Validate file type
-            if not file.filename.lower().endswith('.pdf'):
+            # Validate file type using the document processor's supported formats
+            from ..shared.pdf_utils import is_supported_format, get_supported_extensions
+            
+            if not file.filename or not is_supported_format(file.filename):
+                supported_formats = ', '.join(get_supported_extensions())
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Only PDF files are supported. Invalid file: {file.filename}"
+                    detail=f"Unsupported file format: {file.filename}. Supported formats: {supported_formats}"
                 )
             
             # Validate file size (max 50MB per file)
@@ -3148,6 +3119,47 @@ async def get_query_cache_info(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Cache info service error"
         )
+
+
+# WebSocket endpoint for real-time updates
+from fastapi import WebSocket, WebSocketDisconnect
+from ..shared.websocket_manager import websocket_manager
+
+@app.websocket("/ws/updates")
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    """
+    WebSocket endpoint for real-time updates.
+    
+    Args:
+        websocket: WebSocket connection
+        token: Authentication token from query parameter
+    """
+    if not token:
+        await websocket.close(code=4001)
+        return
+    
+    try:
+        # Connect and authenticate
+        connection = await websocket_manager.connect(websocket, token)
+        
+        # Handle messages
+        while True:
+            try:
+                message = await websocket.receive_text()
+                await websocket_manager.handle_message(connection.connection_id, message)
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket message error: {e}")
+                break
+    
+    except Exception as e:
+        logger.error(f"WebSocket connection error: {e}")
+    
+    finally:
+        # Clean up connection
+        if 'connection' in locals():
+            await websocket_manager.disconnect(connection.connection_id)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,18 @@ class RAGApp {
         this.reconnectDelay = 1000;
         this.selectedFiles = [];
 
+        // Supported file types and their MIME types
+        this.supportedFileTypes = {
+            'application/pdf': '.pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+            'application/vnd.ms-excel': '.xls',
+            'text/html': '.html',
+            'text/markdown': '.md',
+            'text/csv': '.csv'
+        };
+
         this.init();
     }
 
@@ -104,7 +116,7 @@ class RAGApp {
             e.preventDefault();
             uploadArea.classList.remove('dragover');
             const files = Array.from(e.dataTransfer.files).filter(file =>
-                file.type === 'application/pdf'
+                this.isSupportedFileType(file)
             );
             this.handleFileSelection(files);
         });
@@ -118,7 +130,10 @@ class RAGApp {
             this.handleFileSelection(files);
         });
 
-        uploadBtn.addEventListener('click', this.handleFileUpload.bind(this));
+        uploadBtn.addEventListener('click', (e) => {
+            console.log('Upload button clicked');
+            this.handleFileUpload();
+        });
     }
 
     handleFileSelection(files) {
@@ -141,10 +156,11 @@ class RAGApp {
             fileItem.className = 'file-item';
             fileItem.innerHTML = `
                 <div class="file-info">
-                    <i class="fas fa-file-pdf file-icon"></i>
+                    ${this.getFileIcon(file.name)}
                     <div class="file-details">
                         <div class="file-name">${file.name}</div>
                         <div class="file-size">${this.formatFileSize(file.size)}</div>
+                        <div class="file-type">${this.getFileTypeLabel(file.name)}</div>
                     </div>
                 </div>
                 <button class="remove-file" data-index="${index}">
@@ -174,15 +190,20 @@ class RAGApp {
     }
 
     async handleFileUpload() {
+        console.log('handleFileUpload called');
         const groupSelect = document.getElementById('groupSelect');
         const groupId = groupSelect ? groupSelect.value : '';
+        console.log('Group ID:', groupId);
+        console.log('Selected files:', this.selectedFiles);
 
         if (!groupId) {
+            console.log('No group selected');
             this.showToast('error', 'Error', 'Please select a group');
             return;
         }
 
         if (!this.selectedFiles || this.selectedFiles.length === 0) {
+            console.log('No files selected');
             this.showToast('error', 'Error', 'Please select files to upload');
             return;
         }
@@ -385,9 +406,9 @@ class RAGApp {
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ 
-                    username: usernameValue, 
-                    password: passwordValue 
+                body: JSON.stringify({
+                    username: usernameValue,
+                    password: passwordValue
                 })
             });
 
@@ -587,6 +608,7 @@ class RAGApp {
             }
 
             const result = await response.json();
+            console.log('Documents loaded:', result);
             this.displayDocuments(result.documents || []);
 
         } catch (error) {
@@ -611,7 +633,7 @@ class RAGApp {
         documentsGrid.innerHTML = documents.map(doc => `
             <div class="document-card">
                 <div class="document-header">
-                    <i class="fas fa-file-pdf document-icon"></i>
+                    ${this.getFileIcon(doc.filename || 'unknown.pdf').replace('file-icon', 'document-icon')}
                     <div class="document-title">${doc.filename || 'Unknown'}</div>
                 </div>
                 <div class="document-meta">
@@ -859,6 +881,10 @@ class RAGApp {
         console.log('WebSocket message:', message);
 
         switch (message.type) {
+            case 'pong':
+                // Handle pong response to ping - just update connection status
+                console.log('Received pong from server');
+                break;
             case 'job_update':
                 this.handleJobUpdate(message.data);
                 break;
@@ -868,6 +894,9 @@ class RAGApp {
             case 'error':
                 console.error('WebSocket error:', message.error);
                 this.showToast('error', 'Connection Error', message.error.message);
+                break;
+            case 'connection_established':
+                console.log('WebSocket connection established:', message);
                 break;
             default:
                 console.log('Unknown WebSocket message type:', message.type);
@@ -900,10 +929,10 @@ class RAGApp {
         if (this.heartbeatInterval) {
             clearInterval(this.heartbeatInterval);
         }
-        
+
         this.heartbeatInterval = setInterval(() => {
             if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                this.websocket.send(JSON.stringify({ type: 'heartbeat' }));
+                this.websocket.send(JSON.stringify({ type: 'ping' }));
             }
         }, 30000); // Every 30 seconds
     }
@@ -1004,6 +1033,70 @@ class RAGApp {
                 return '<i class="fas fa-search"></i>';
             default:
                 return '<i class="fas fa-cog"></i>';
+        }
+    }
+
+    isSupportedFileType(file) {
+        // Check by MIME type first
+        if (this.supportedFileTypes[file.type]) {
+            return true;
+        }
+        
+        // Fallback to file extension check
+        const fileName = file.name.toLowerCase();
+        const supportedExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.xls', '.html', '.md', '.csv'];
+        return supportedExtensions.some(ext => fileName.endsWith(ext));
+    }
+
+    getFileIcon(fileName) {
+        const ext = fileName.toLowerCase().split('.').pop();
+        switch (ext) {
+            case 'pdf':
+                return '<i class="fas fa-file-pdf file-icon"></i>';
+            case 'docx':
+            case 'doc':
+                return '<i class="fas fa-file-word file-icon"></i>';
+            case 'pptx':
+            case 'ppt':
+                return '<i class="fas fa-file-powerpoint file-icon"></i>';
+            case 'xlsx':
+            case 'xls':
+                return '<i class="fas fa-file-excel file-icon"></i>';
+            case 'html':
+            case 'htm':
+                return '<i class="fas fa-file-code file-icon"></i>';
+            case 'md':
+                return '<i class="fab fa-markdown file-icon"></i>';
+            case 'csv':
+                return '<i class="fas fa-file-csv file-icon"></i>';
+            default:
+                return '<i class="fas fa-file file-icon"></i>';
+        }
+    }
+
+    getFileTypeLabel(fileName) {
+        const ext = fileName.toLowerCase().split('.').pop();
+        switch (ext) {
+            case 'pdf':
+                return 'PDF Document';
+            case 'docx':
+            case 'doc':
+                return 'Word Document';
+            case 'pptx':
+            case 'ppt':
+                return 'PowerPoint Presentation';
+            case 'xlsx':
+            case 'xls':
+                return 'Excel Spreadsheet';
+            case 'html':
+            case 'htm':
+                return 'HTML Document';
+            case 'md':
+                return 'Markdown Document';
+            case 'csv':
+                return 'CSV Spreadsheet';
+            default:
+                return 'Document';
         }
     }
 }

@@ -2,7 +2,7 @@
 
 ## 1. Objective
 
-This project provides a secure, concurrent, multi-user, and private Retrieval-Augmented Generation (RAG) system. It allows multiple users to simultaneously upload their own private PDF documents and query them using a local Large Language Model (LLM). The system has been transformed from a single-threaded application into a robust, production-ready system that can handle concurrent operations safely and efficiently.
+This project provides a secure, concurrent, multi-user, and private Retrieval-Augmented Generation (RAG) system. It allows multiple users to simultaneously upload their own private documents in multiple formats (PDF, DOCX, PPTX, XLSX, HTML, MD, CSV) and query them using a local Large Language Model (LLM). The system has been transformed from a single-threaded application into a robust, production-ready system that can handle concurrent operations safely and efficiently.
 
 The key goals are:
 - **Data Privacy:** Ensure users can only query their own documents or documents from groups they belong to, with complete isolation between users.
@@ -30,6 +30,7 @@ The key goals are:
 - **Job Management:** Track, monitor, and manage document processing and query jobs with detailed status reporting.
 - **Resource Management:** Intelligent resource allocation and monitoring to prevent system overload.
 - **Comprehensive Monitoring:** System health checks, performance metrics, and error tracking.
+- **Multi-Format Document Support:** Advanced document processing using Docling for PDF, DOCX, PPTX, XLSX, HTML, MD, and CSV files with enhanced text extraction and OCR capabilities.
 
 ---
 
@@ -58,8 +59,8 @@ The system has been completely redesigned as a modern, concurrent web applicatio
 ### Data Layer
 - **LanceDB Vector Store**: Stores document embeddings with user isolation metadata
 - **Redis**: Session storage, job tracking, and caching
-- **Document Processor** (`app/shared/document_processor.py`): PDF processing and embedding service
-- **PDF Utils** (`app/shared/pdf_utils.py`): Centralized PDF text extraction utilities
+- **Document Processor** (`app/shared/document_processor.py`): Multi-format document processing and embedding service
+- **Document Utils** (`app/shared/pdf_utils.py`): Docling-powered text extraction utilities for multiple document formats
 
 ### Key Architectural Improvements
 
@@ -75,6 +76,7 @@ The system has been completely redesigned as a modern, concurrent web applicatio
 
 -   **LLM:** `Llama-3.2-3B-Instruct-IQ3_M.gguf` (a quantized model for efficient local inference).
 -   **Embedding Model:** `Alibaba-NLP/gte-large-en-v1.5` (quantized for CPU performance).
+-   **Document Processing:** `Docling` (advanced multi-format document parsing with OCR capabilities).
 -   **Vector Database:** `LanceDB` (for efficient, file-based vector storage).
 -   **Task Queue:** `Redis` + `Celery` (for background job processing and message brokering).
 -   **Web Framework:** `FastAPI` (for REST API and WebSocket support).
@@ -132,7 +134,7 @@ The concurrent system requires multiple components to be running:
     -   Default credentials are defined in the authentication manager
 2.  **Upload Documents:** 
     - Navigate to the "Upload Documents" tab
-    - Select your PDF files using drag-and-drop or file browser
+    - Select your documents (PDF, DOCX, PPTX, XLSX, HTML, MD, CSV) using drag-and-drop or file browser
     - Choose a destination group
     - Upload files are processed asynchronously with real-time progress updates
 3.  **Query Documents:** 
@@ -145,20 +147,59 @@ The concurrent system requires multiple components to be running:
 
 ---
 
-## 6. Modularity and Customization
+## 6. Multi-Format Document Processing
+
+### Docling Integration
+
+The system has been upgraded from using PyMuPDF (fitz) to **Docling**, a state-of-the-art document processing library that provides superior text extraction and multi-format support.
+
+### Supported Document Formats
+
+| Format | Extension | Description | Features |
+|--------|-----------|-------------|----------|
+| **PDF** | `.pdf` | Portable Document Format | OCR support, table extraction, layout preservation |
+| **Word** | `.docx` | Microsoft Word documents | Full text extraction, formatting preservation |
+| **PowerPoint** | `.pptx` | Microsoft PowerPoint presentations | Slide content extraction, text and layout |
+| **Excel** | `.xlsx`, `.xls` | Microsoft Excel spreadsheets | Cell data extraction, sheet processing |
+| **HTML** | `.html` | Web documents | Tag-aware text extraction, structure preservation |
+| **Markdown** | `.md` | Markdown documents | Native markdown processing, structure awareness |
+| **CSV** | `.csv` | Comma-separated values | Tabular data processing, column extraction |
+
+### Enhanced Features
+
+- **OCR Capabilities**: Automatic text extraction from scanned documents and images
+- **Table Structure Recognition**: Intelligent table detection and data extraction
+- **Layout Preservation**: Maintains document structure through markdown export
+- **Metadata Extraction**: Comprehensive document metadata for all formats
+- **Error Handling**: Robust processing with graceful fallbacks for corrupted files
+- **Visual File Management**: Format-specific icons and type identification in the UI
+
+### Processing Pipeline
+
+1. **Format Detection**: Automatic file type identification by extension and MIME type
+2. **Document Conversion**: Docling processes the document using format-specific parsers
+3. **Text Extraction**: Advanced text extraction with structure preservation
+4. **Chunking**: Intelligent text splitting with overlap for better retrieval
+5. **Embedding**: Vector generation using the embedding model
+6. **Storage**: Secure storage in LanceDB with user isolation metadata
+
+---
+
+## 7. Modularity and Customization
 
 The system is designed to be modular and easily customizable:
 
 -   **LLM:** To use a different model, change the `GGUF_MODEL_PATH` in `app/shared/query_engine_factory.py` to point to another GGUF-compatible file.
 -   **Retriever:** The retrieval logic in the query engine factory can be modified to use different LlamaIndex retrievers (e.g., hybrid search, different MMR settings).
--   **Data Formats:** The document processor (`app/shared/document_processor.py`) can be extended to support other file types (e.g., `.txt`, `.docx`) by adding new data loaders to the PDF utils.
+-   **Document Formats:** The Docling-powered document processor supports multiple formats out of the box. Additional formats can be added by extending the `SUPPORTED_FORMATS` dictionary in `app/shared/pdf_utils.py` as Docling adds support for new formats.
+-   **Document Processing:** The text extraction pipeline can be customized by modifying the Docling converter configuration for format-specific optimizations (OCR settings, table extraction, etc.).
 -   **Workers:** Additional worker types can be added to handle different processing tasks or integrate with external services.
 -   **Authentication:** The authentication system can be extended to integrate with external identity providers (LDAP, OAuth, etc.).
 -   **Storage:** The system can be configured to use different vector databases or add additional storage backends.
 
 ---
 
-## 7. Production Deployment
+## 8. Production Deployment
 
 ### Docker Support
 The system includes Docker containerization for easy deployment:

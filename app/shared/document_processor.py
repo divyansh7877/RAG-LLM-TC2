@@ -20,7 +20,7 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 
 from .config import config
 from .error_handling import StructuredLogger
-from .pdf_utils import extract_text_from_pdf, clean_text
+from .pdf_utils import extract_text_from_document, extract_text_from_pdf, clean_text, is_supported_format, get_supported_extensions
 
 # ---------------------------------------------------------------------------
 # Service Functions
@@ -59,7 +59,7 @@ class DocumentProcessor:
         Process documents for embedding with proper error handling and monitoring.
         
         Args:
-            file_paths: List of PDF file paths to process
+            file_paths: List of document file paths to process (PDF, DOCX, PPTX, XLSX, etc.)
             user_id: ID of the user uploading the documents
             group_id: Group ID for the documents
             job_id: Optional job ID for tracking
@@ -94,13 +94,16 @@ class DocumentProcessor:
                 'files': [os.path.basename(f) for f in file_paths]
             })
             
-            # Validate files exist
+            # Validate files exist and are supported formats
             valid_files = []
+            supported_exts = get_supported_extensions()
+            
             for file_path in file_paths:
-                if os.path.exists(file_path) and file_path.lower().endswith('.pdf'):
+                if os.path.exists(file_path) and is_supported_format(file_path):
                     valid_files.append(file_path)
                 else:
-                    self.logger.warning(f"Skipping invalid file: {file_path}")
+                    ext = os.path.splitext(file_path)[1].lower()
+                    self.logger.warning(f"Skipping invalid file: {file_path} (extension: {ext}, supported: {supported_exts})")
             
             if not valid_files:
                 return EmbeddingResult(
@@ -108,12 +111,12 @@ class DocumentProcessor:
                     document_count=0,
                     chunk_count=0,
                     processing_time=time.time() - start_time,
-                    error="No valid PDF files found",
+                    error=f"No valid document files found. Supported formats: {', '.join(supported_exts)}",
                     job_id=job_id
                 )
             
-            # Build nodes from PDFs
-            nodes = self._build_nodes_from_pdfs(
+            # Build nodes from documents
+            nodes = self._build_nodes_from_documents(
                 valid_files,
                 user_id=user_id,
                 group_id=group_id,
@@ -180,6 +183,61 @@ class DocumentProcessor:
                 job_id=job_id
             )
     
+    def _build_nodes_from_documents(
+        self,
+        file_paths: List[str],
+        user_id: str,
+        group_id: str,
+        chunk_size: int = 512,
+        chunk_overlap: int = 20,
+    ):
+        """Build nodes from a list of documents with user/group metadata."""
+        nodes = []
+        for file_path in file_paths:
+            document_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            try:
+                # Extract text from document using Docling
+                pages = extract_text_from_document(file_path)
+                
+                # Create documents for each page
+                documents = []
+                for page_text, page_number in pages:
+                    cleaned_text = clean_text(page_text)
+                    metadata = {
+                        "document_name": document_name,
+                        "page_number": page_number,
+                        "user_id": user_id,
+                        "group_id": group_id,
+                        "file_format": file_ext,
+                        "file_path": file_path,
+                    }
+                    documents.append(
+                        Document(
+                            text=cleaned_text,
+                            metadata=metadata,
+                            id_=f"{document_name}_p{page_number}",
+                        )
+                    )
+                
+                # Split documents into chunks
+                splitter = SentenceSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    include_metadata=True,
+                )
+                nodes.extend(splitter.get_nodes_from_documents(documents))
+                
+                self.logger.info(f"Processed {document_name}: {len(pages)} pages, {len(documents)} documents")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to process {document_name}: {str(e)}", exc_info=True)
+                # Continue processing other files even if one fails
+                continue
+        
+        return nodes
+
     def _build_nodes_from_pdfs(
         self,
         pdf_paths: List[str],
@@ -188,41 +246,8 @@ class DocumentProcessor:
         chunk_size: int = 512,
         chunk_overlap: int = 20,
     ):
-        """Build nodes from a list of PDFs with user/group metadata."""
-        nodes = []
-        for pdf_path in pdf_paths:
-            document_name = os.path.basename(pdf_path)
-            
-            # Extract text from PDF using utility function
-            pages = extract_text_from_pdf(pdf_path)
-            
-            # Create documents for each page
-            documents = []
-            for page_text, page_number in pages:
-                cleaned_text = clean_text(page_text)
-                metadata = {
-                    "document_name": document_name,
-                    "page_number": page_number,
-                    "user_id": user_id,
-                    "group_id": group_id,
-                }
-                documents.append(
-                    Document(
-                        text=cleaned_text,
-                        metadata=metadata,
-                        id_=f"{document_name}_p{page_number}",
-                    )
-                )
-            
-            # Split documents into chunks
-            splitter = SentenceSplitter(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                include_metadata=True,
-            )
-            nodes.extend(splitter.get_nodes_from_documents(documents))
-        
-        return nodes
+        """Build nodes from a list of PDFs with user/group metadata (backward compatibility)."""
+        return self._build_nodes_from_documents(pdf_paths, user_id, group_id, chunk_size, chunk_overlap)
     
     def _embed_and_store(
         self,
@@ -230,7 +255,7 @@ class DocumentProcessor:
         db_path: str,
         table_name: str = "document_embeddings",
         embed_model_name: str = "./models/gte-large-en-v1.5",
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         """Embed nodes and store in LanceDB."""
         # Initialize embedding model
@@ -238,7 +263,6 @@ class DocumentProcessor:
             model_name=embed_model_name,
             device=device,
             trust_remote_code=True,
-            model_kwargs={"quantize": "static-int8"},
         )
 
         # Connect to LanceDB
@@ -265,7 +289,6 @@ class DocumentProcessor:
                 model_name="./models/gte-large-en-v1.5",
                 device="cpu",
                 trust_remote_code=True,
-                model_kwargs={"quantize": "static-int8"},
             )
             
             # Test embedding a small text
@@ -293,28 +316,38 @@ class DocumentProcessor:
 
 def get_document_info(file_path: str) -> Dict[str, Any]:
     """
-    Get information about a PDF document.
+    Get information about a document file.
     
     Args:
-        file_path: Path to the PDF file
+        file_path: Path to the document file
         
     Returns:
-        dict: Document information including page count, file size, etc.
+        dict: Document information including page count, file size, format, etc.
     """
     try:
         if not os.path.exists(file_path):
             return {"error": "File not found"}
         
+        if not is_supported_format(file_path):
+            ext = os.path.splitext(file_path)[1].lower()
+            supported_exts = get_supported_extensions()
+            return {
+                "error": f"Unsupported file format: {ext}. Supported formats: {', '.join(supported_exts)}",
+                "filename": os.path.basename(file_path)
+            }
+        
         # Get file stats
         file_stats = os.stat(file_path)
         file_size = file_stats.st_size
+        file_ext = os.path.splitext(file_path)[1].lower()
         
-        # Get PDF info using utility function
-        pages = extract_text_from_pdf(file_path)
+        # Get document info using utility function
+        pages = extract_text_from_document(file_path)
         page_count = len(pages)
         
         return {
             "filename": os.path.basename(file_path),
+            "file_format": file_ext,
             "file_size": file_size,
             "page_count": page_count,
             "file_path": file_path,
@@ -329,10 +362,10 @@ def get_document_info(file_path: str) -> Dict[str, Any]:
 
 def estimate_processing_time(file_paths: List[str]) -> Dict[str, Any]:
     """
-    Estimate processing time for a list of PDF files.
+    Estimate processing time for a list of document files.
     
     Args:
-        file_paths: List of PDF file paths
+        file_paths: List of document file paths (PDF, DOCX, PPTX, XLSX, etc.)
         
     Returns:
         dict: Estimated processing time and other metrics
@@ -341,18 +374,51 @@ def estimate_processing_time(file_paths: List[str]) -> Dict[str, Any]:
         total_pages = 0
         total_size = 0
         valid_files = 0
+        format_counts = {}
         
         for file_path in file_paths:
-            if os.path.exists(file_path) and file_path.lower().endswith('.pdf'):
+            if os.path.exists(file_path) and is_supported_format(file_path):
                 doc_info = get_document_info(file_path)
                 if "error" not in doc_info:
                     total_pages += doc_info.get("page_count", 0)
                     total_size += doc_info.get("file_size", 0)
                     valid_files += 1
+                    
+                    # Track format distribution
+                    file_format = doc_info.get("file_format", "unknown")
+                    format_counts[file_format] = format_counts.get(file_format, 0) + 1
         
         # Rough estimates based on typical processing times
         # These should be calibrated based on actual system performance
-        estimated_seconds = (total_pages * 2) + (total_size / (1024 * 1024) * 10)  # 2 sec/page + 10 sec/MB
+        # Different formats may have different processing speeds
+        base_time_per_page = 2  # seconds per page
+        base_time_per_mb = 10   # seconds per MB
+        
+        # Adjust processing time based on file formats
+        format_multipliers = {
+            '.pdf': 1.0,     # baseline
+            '.docx': 0.8,    # usually faster than PDF
+            '.pptx': 1.2,    # may be slower due to complex layouts
+            '.xlsx': 0.6,    # usually simpler structure
+            '.xls': 0.6,
+            '.html': 0.5,    # simple text processing
+            '.md': 0.3,      # very simple
+            '.txt': 0.2,     # fastest
+        }
+        
+        # Calculate weighted processing time
+        weighted_multiplier = 1.0
+        if format_counts:
+            total_files = sum(format_counts.values())
+            weighted_multiplier = sum(
+                format_multipliers.get(fmt, 1.0) * count / total_files
+                for fmt, count in format_counts.items()
+            )
+        
+        estimated_seconds = (
+            (total_pages * base_time_per_page) + 
+            (total_size / (1024 * 1024) * base_time_per_mb)
+        ) * weighted_multiplier
         
         return {
             "estimated_time_seconds": int(estimated_seconds),
@@ -360,7 +426,9 @@ def estimate_processing_time(file_paths: List[str]) -> Dict[str, Any]:
             "total_pages": total_pages,
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "valid_files": valid_files,
-            "invalid_files": len(file_paths) - valid_files
+            "invalid_files": len(file_paths) - valid_files,
+            "format_distribution": format_counts,
+            "supported_formats": get_supported_extensions()
         }
         
     except Exception as e:
