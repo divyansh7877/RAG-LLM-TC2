@@ -18,6 +18,7 @@ from ..shared.job_manager import job_manager
 
 # Import embedding functionality
 from ..shared.document_processor import document_processor, get_document_info, estimate_processing_time
+from ..shared.embedding_optimizer import set_optimal_threading_environment
 import hashlib
 import uuid
 
@@ -332,13 +333,16 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         if not isinstance(file_paths, list) or len(file_paths) == 0:
             raise ValueError("file_paths must be a non-empty list")
         
+        # Set optimal threading environment for this worker
+        set_optimal_threading_environment()
+        
         # Update job status to processing (this will trigger WebSocket notification)
         job_manager.update_job_status(job_id, JobStatus.PROCESSING)
         
-        logger.info(f"Starting embedding job {job_id} for user {user_id}, group {group_id}, {len(file_paths)} files")
+        logger.info(f"Starting optimized embedding job {job_id} for user {user_id}, group {group_id}, {len(file_paths)} files")
         
         # Update progress
-        update_job_progress(job_id, 0.1, "Starting document processing...")
+        update_job_progress(job_id, 0.1, "Starting optimized document processing...")
         
         # Use the document processor service
         result = document_processor.process_documents(

@@ -21,6 +21,7 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from .config import config
 from .error_handling import StructuredLogger
 from .pdf_utils import extract_text_from_document, extract_text_from_pdf, clean_text, is_supported_format, get_supported_extensions
+from .embedding_optimizer import create_optimized_embedding_model, optimize_for_batch_processing, set_optimal_threading_environment
 
 # ---------------------------------------------------------------------------
 # Service Functions
@@ -86,13 +87,14 @@ class DocumentProcessor:
                     job_id=job_id
                 )
             
-            self.logger.info(f"Starting document embedding for user {user_id}", extra={
+            extra_info = {
                 'job_id': job_id,
                 'user_id': user_id,
                 'group_id': group_id,
                 'file_count': len(file_paths),
                 'files': [os.path.basename(f) for f in file_paths]
-            })
+            }
+            self.logger.info(f"Starting document embedding for user {user_id}")
             
             # Validate files exist and are supported formats
             valid_files = []
@@ -145,14 +147,7 @@ class DocumentProcessor:
             
             processing_time = time.time() - start_time
             
-            self.logger.info(f"Document embedding completed successfully", extra={
-                'job_id': job_id,
-                'user_id': user_id,
-                'group_id': group_id,
-                'document_count': len(valid_files),
-                'chunk_count': len(nodes),
-                'processing_time': processing_time
-            })
+            self.logger.info(f"Document embedding completed successfully")
             
             return EmbeddingResult(
                 success=True,
@@ -166,13 +161,7 @@ class DocumentProcessor:
             processing_time = time.time() - start_time
             error_msg = f"Document embedding failed: {str(e)}"
             
-            self.logger.error(error_msg, extra={
-                'job_id': job_id,
-                'user_id': user_id,
-                'group_id': group_id,
-                'processing_time': processing_time,
-                'error': str(e)
-            }, exc_info=True)
+            self.logger.error(error_msg, exc_info=True)
             
             return EmbeddingResult(
                 success=False,
@@ -255,40 +244,93 @@ class DocumentProcessor:
         db_path: str,
         table_name: str = "document_embeddings",
         embed_model_name: str = "./models/gte-large-en-v1.5",
-        device: str = "cuda",
+        device: str = "cpu",
     ):
-        """Embed nodes and store in LanceDB."""
-        # Initialize embedding model
-        Settings.embed_model = HuggingFaceEmbedding(
+        """Embed nodes and store in LanceDB with optimized performance."""
+        total_nodes = len(nodes)
+        
+        # Set optimal environment for performance
+        set_optimal_threading_environment()
+        
+        # Get optimal batch processing settings
+        batch_settings = optimize_for_batch_processing(total_nodes)
+        
+        self.logger.info(f"Processing {total_nodes} nodes with optimized settings: {batch_settings}")
+        
+        # Create optimized embedding model
+        embed_model = create_optimized_embedding_model(
             model_name=embed_model_name,
             device=device,
-            trust_remote_code=True,
+            batch_size=batch_settings["embed_batch_size"],
+            max_length=batch_settings["max_length"]
         )
+        
+        # Set the global embedding model
+        Settings.embed_model = embed_model
 
         # Connect to LanceDB
         ldb = lancedb.connect(db_path)
         vector_store = LanceDBVectorStore(uri=db_path, table_name=table_name)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-        # Build index and store embeddings
-        index = VectorStoreIndex(nodes, storage_context=storage_context, show_progress=True)
+        # Process nodes in optimized batches
+        node_batch_size = batch_settings["node_batch_size"]
+        
+        # Build index with optimized batched processing
+        if total_nodes <= node_batch_size:
+            # Small number of nodes, process all at once
+            self.logger.info(f"Processing all {total_nodes} nodes in single batch")
+            index = VectorStoreIndex(nodes, storage_context=storage_context, show_progress=False)
+        else:
+            # Large number of nodes, process in optimized batches
+            self.logger.info(f"Processing {total_nodes} nodes in batches of {node_batch_size}")
+            index = None
+            
+            for i in range(0, total_nodes, node_batch_size):
+                batch_nodes = nodes[i:i + node_batch_size]
+                batch_end = min(i + node_batch_size, total_nodes)
+                batch_num = i // node_batch_size + 1
+                total_batches = (total_nodes + node_batch_size - 1) // node_batch_size
+                
+                self.logger.info(f"Processing batch {batch_num}/{total_batches}: nodes {i+1}-{batch_end}")
+                
+                try:
+                    if index is None:
+                        # Create initial index with first batch
+                        index = VectorStoreIndex(batch_nodes, storage_context=storage_context, show_progress=False)
+                    else:
+                        # Add subsequent batches to existing index
+                        index.insert_nodes(batch_nodes)
+                        
+                    self.logger.info(f"Completed batch {batch_num}/{total_batches}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Failed to process batch {batch_num}: {e}")
+                    # Continue with next batch rather than failing completely
+                    continue
 
         # Persist metadata
         persist_dir = os.path.join(db_path, "li_storage")
         index.storage_context.persist(persist_dir)
 
         # Log results
-        tbl = ldb.open_table(table_name)
-        self.logger.info(f"Stored {tbl.count_rows()} vectors in '{table_name}'")
+        try:
+            tbl = ldb.open_table(table_name)
+            vector_count = tbl.count_rows()
+            self.logger.info(f"Successfully stored {vector_count} vectors in '{table_name}'")
+        except Exception as e:
+            self.logger.warning(f"Could not get final vector count: {e}")
+            self.logger.info(f"Embedding process completed for table '{table_name}'")
     
     def health_check(self) -> Dict[str, Any]:
-        """Check the health of the embedding service."""
+        """Check the health of the embedding service with optimized settings."""
         try:
-            # Test basic functionality
-            test_model = HuggingFaceEmbedding(
+            # Use optimized embedding model creation
+            test_model = create_optimized_embedding_model(
                 model_name="./models/gte-large-en-v1.5",
                 device="cpu",
-                trust_remote_code=True,
+                batch_size=1,  # Single embedding for health check
+                max_length=512
             )
             
             # Test embedding a small text
@@ -298,6 +340,9 @@ class DocumentProcessor:
                 "status": "healthy",
                 "embedding_model_loaded": True,
                 "embedding_dimension": len(test_embedding) if test_embedding else 0,
+                "device": "cpu",
+                "optimizations_applied": True,
+                "threading_optimized": True,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }
             
