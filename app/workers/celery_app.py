@@ -9,10 +9,21 @@ import logging
 import os
 import psutil
 import time
+import multiprocessing
 
-# Configure logging
+# Configure logging as early as possible
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Set the start method to 'spawn' for fork-safety
+# This is crucial for libraries like LanceDB that are not fork-safe.
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    # This will fail if the start method has already been set.
+    # We can safely ignore this if it's already set to 'spawn'.
+    if multiprocessing.get_start_method() != "spawn":
+        logger.warning("Could not set multiprocessing start method to 'spawn'.")
 
 # Create Celery app
 celery_app = Celery(
@@ -40,9 +51,9 @@ celery_app.conf.update(
     task_acks_late=True,  # Acknowledge task only after completion
     worker_disable_rate_limits=False,
     
-    # Task time limits with graceful handling
-    task_soft_time_limit=config.RESOURCE_LIMITS["worker_timeout"],
-    task_time_limit=config.RESOURCE_LIMITS["worker_timeout"] + 60,
+    # Task time limits with graceful handling (configurable)
+    task_soft_time_limit=config.CELERY_TASK_SOFT_TIME_LIMIT,
+    task_time_limit=config.CELERY_TASK_TIME_LIMIT,
     task_reject_on_worker_lost=True,
     
     # Result backend settings
@@ -76,8 +87,8 @@ celery_app.conf.update(
     worker_direct=True,  # Enable direct queue routing
     
     # Resource limits and worker lifecycle
-    worker_max_tasks_per_child=100,  # Restart worker after 100 tasks to prevent memory leaks
-    worker_max_memory_per_child=2048000,  # 2GB memory limit per worker
+    worker_max_tasks_per_child=10,  # Restart worker after 100 tasks to prevent memory leaks
+    worker_max_memory_per_child=6048000,  # 2GB memory limit per worker
     worker_autoscaler="celery.worker.autoscale:Autoscaler",
     
     # Retry configuration
@@ -93,17 +104,17 @@ celery_app.conf.update(
         },
         "cleanup-query-cache": {
             "task": "cleanup_query_cache",
-            "schedule": 600.0,  # Every 10 minutes
+            "schedule": 660.0,  # Every 10 minutes
             "options": {"queue": "maintenance"}
         },
         "system-health-check": {
             "task": "system_health_check", 
-            "schedule": 60.0,  # Every minute
+            "schedule": 150.0,  # Every 
             "options": {"queue": "maintenance"}
         },
         "worker-health-report": {
             "task": "worker_health_report",
-            "schedule": 30.0,  # Every 30 seconds
+            "schedule": 200.0,  # Every 200 seconds
             "options": {"queue": "maintenance"}
         }
     },

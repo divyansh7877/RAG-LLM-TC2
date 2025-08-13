@@ -218,6 +218,15 @@ class QueryEngineFactory:
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
 
+    def cleanup(self):
+        """Clean up resources to free up memory."""
+        with self._lock:
+            self._embed_model = None
+            self._llm = None
+            self._vector_store = None
+            self._index = None
+            self.logger.info("Query engine factory resources have been cleaned up.")
+
 # ---------------------------------------------------------------------------
 # Query Processing Functions
 # ---------------------------------------------------------------------------

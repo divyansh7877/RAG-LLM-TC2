@@ -2,16 +2,18 @@ import gradio as gr
 import os
 import shutil
 import subprocess
-from functools import partial
+
 import uuid
 import time
 import threading
 from collections import defaultdict
 
 # Import the new query function
-from new_rag_ui import process_query
-# Import embedding function directly
-from new_embedder import embed_and_store, build_nodes_from_pdfs
+
+from app.shared.job_manager import job_manager
+from app.shared.models import JobType
+from app.workers.embedding_worker import process_document_embedding
+
 
 # --- User Management (Prototype) ---
 USERS = {
@@ -142,12 +144,14 @@ session_manager = SessionManager()
 # --- Backend Functions ---
 
 def embed_files(files, destination, session_id):
-    """Embeds uploaded files directly without spawning subprocesses."""
+    """
+    Handles file uploads by creating a job and triggering a Celery task.
+    """
     # Validate session
     user_data = session_manager.get_session(session_id)
     if not user_data:
         return "Error: Invalid or expired session. Please login again."
-    
+
     username = user_data.get("username")
     if not username or not files or not destination:
         return "Error: Missing user info, files, or destination."
@@ -163,53 +167,32 @@ def embed_files(files, destination, session_id):
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
-        # Copy files to temp directory
+        # Copy files to a temporary directory
         filepaths = [shutil.copy(f.name, temp_dir) for f in files]
-        
-        # Build nodes with user/group metadata
-        nodes = build_nodes_from_pdfs(
-            filepaths,
+
+        # Create a job to track the embedding process
+        job = job_manager.create_job(
+            user_id=username,
+            job_type=JobType.EMBEDDING,
+            metadata={"file_count": len(filepaths), "destination": destination}
+        )
+
+        # Trigger the Celery task
+        process_document_embedding.delay(
+            job_id=job.job_id,
             user_id=username,
             group_id=group_id,
-            chunk_size=512,
-            chunk_overlap=20
+            file_paths=filepaths
         )
-        
-        # Embed and store directly
-        db_path = os.path.abspath("./multi_user_db.lance")
-        embed_and_store(
-            nodes,
-            db_path=db_path,
-            table_name="document_embeddings",
-            embed_model_name="./models/gte-large-en-v1.5",
-            device="cpu"
-        )
-        
-        shutil.rmtree(temp_dir)
-        return f"Successfully embedded {len(files)} files into '{destination}'."
-        
-    except Exception as e:
-        shutil.rmtree(temp_dir)
-        return f"Error embedding files: {str(e)}"
 
-def query_wrapper(query, session_id):
-    """Wrapper to pass user context to the query engine."""
-    # Validate session
-    user_data = session_manager.get_session(session_id)
-    if not user_data:
-        return "Error: Invalid or expired session. Please login again.", ""
-    
-    username = user_data.get("username")
-    groups = user_data.get("groups", [])
-    if not username:
-        return "Error: User not logged in.", ""
-    
-    # Check rate limiting
-    if not query_rate_limiter.is_allowed(username):
-        remaining = query_rate_limiter.get_remaining_requests(username)
-        return f"Rate limit exceeded. You can make {remaining} more queries in the next minute.", ""
-    
-    return process_query(query, username, groups)
+        return f"Upload successful! Your files are being processed. Job ID: {job.job_id}"
+
+    except Exception as e:
+        # Clean up the temporary directory in case of an error
+        shutil.rmtree(temp_dir)
+        return f"Error creating embedding job: {str(e)}"
+
+
 
 # --- Main Application UI and Logic ---
 

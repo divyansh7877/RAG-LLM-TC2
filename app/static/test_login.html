@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Test</title>
+</head>
+<body>
+    <h1>Login Test</h1>
+    <form id="testForm">
+        <input type="text" id="username" value="assistant1" placeholder="Username">
+        <input type="password" id="password" value="password1" placeholder="Password">
+        <button type="submit">Login</button>
+    </form>
+    <div id="result"></div>
+
+    <script>
+        document.getElementById('testForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const resultDiv = document.getElementById('result');
+            
+            try {
+                console.log('Attempting login...');
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                console.log('Response status:', response.status);
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error?.message || 'Login failed');
+                }
+                
+                const result = await response.json();
+                console.log('Login successful:', result);
+                
+                resultDiv.innerHTML = `
+                    <h2>Login Successful!</h2>
+                    <p>User: ${result.user_id}</p>
+                    <p>Groups: ${result.groups.join(', ')}</p>
+                    <p>Token: ${result.access_token.substring(0, 50)}...</p>
+                `;
+                
+                // Test session endpoint
+                const sessionResponse = await fetch('/api/auth/session', {
+                    headers: {
+                        'Authorization': `Bearer ${result.access_token}`
+                    }
+                });
+                
+                if (sessionResponse.ok) {
+                    const sessionData = await sessionResponse.json();
+                    console.log('Session data:', sessionData);
+                    resultDiv.innerHTML += `
+                        <h3>Session Info:</h3>
+                        <pre>${JSON.stringify(sessionData, null, 2)}</pre>
+                    `;
+                } else {
+                    console.error('Session request failed:', sessionResponse.status);
+                }
+                
+            } catch (error) {
+                console.error('Login error:', error);
+                resultDiv.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+            }
+        });
+    </script>
+</body>
+</html>

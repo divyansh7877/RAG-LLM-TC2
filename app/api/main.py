@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
+import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -940,86 +941,156 @@ async def logout(
 
 @app.get("/api/documents", tags=["Documents"])
 async def list_documents(
+    request: Request,
     group_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     current_user: UserSession = Depends(get_current_user)
 ):
     """
-    List user's documents.
+    List user's documents with filtering and pagination.
     
     Args:
-        group_id: Filter by group ID
-        status: Filter by processing status
+        request: FastAPI request object
+        group_id: Optional group filter
+        status: Optional status filter
         limit: Maximum number of documents to return
+        offset: Number of documents to skip
         current_user: Current authenticated user
     
     Returns:
-        dict: List of documents
+        dict: List of documents with metadata
     """
     try:
-        # For now, return mock data
-        # In a real implementation, this would query the database
-        mock_documents = [
-            {
-                "document_id": "doc1",
-                "filename": "sample1.pdf",
-                "group_id": "personal",
-                "file_size": 1024000,
-                "upload_date": "2024-01-01T10:00:00Z",
-                "processing_status": "completed"
-            },
-            {
-                "document_id": "doc2", 
-                "filename": "sample2.pdf",
-                "group_id": "personal",
-                "file_size": 2048000,
-                "upload_date": "2024-01-01T11:00:00Z",
-                "processing_status": "processing"
-            }
-        ]
+        # Validate group access if specified
+        if group_id and group_id not in current_user.groups:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"User does not have access to group: {group_id}"
+            )
+        
+        # Get documents from Redis
+        documents = []
+        
+        # Search for user's documents across all groups or specific group
+        groups_to_search = [group_id] if group_id else current_user.groups
+        
+        for group in groups_to_search:
+            pattern = f"document:{current_user.user_id}:{group}:*"
+            with redis_client.get_connection() as client:
+                keys = client.keys(pattern)
+            
+            for key in keys:
+                try:
+                    doc_data = redis_client.get_json(key.decode('utf-8'))
+                    if doc_data:
+                        # Apply status filter if specified
+                        if status and doc_data.get('processing_status') != status:
+                            continue
+                        
+                        # Convert to Document model for validation
+                        document = Document.from_dict(doc_data)
+                        documents.append(document.to_dict())
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to parse document data from key {key}: {e}")
+                    continue
+        
+        # Sort by upload date (newest first)
+        documents.sort(key=lambda x: x.get('upload_date', 0), reverse=True)
+        
+        # Apply pagination
+        total_count = len(documents)
+        paginated_documents = documents[offset:offset + limit]
         
         return {
-            "documents": mock_documents,
-            "total": len(mock_documents),
-            "user_id": current_user.user_id
+            "documents": paginated_documents,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < total_count
         }
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Document list error for user {current_user.user_id}: {e}")
+        logger.error(f"Error listing documents for user {current_user.user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document service error"
+            detail="Document listing service error"
         )
 
 
 @app.delete("/api/documents/{document_id}", tags=["Documents"])
 async def delete_document(
     document_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
 ):
     """
-    Delete a document.
+    Delete a document and its associated data.
     
     Args:
-        document_id: ID of document to delete
+        document_id: Document identifier
         current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
     
     Returns:
-        dict: Deletion result
+        dict: Deletion confirmation
+    
+    Raises:
+        HTTPException: If document not found or deletion fails
     """
     try:
-        # For now, return success
-        # In a real implementation, this would delete from database
+        # Validate permissions
+        if not current_user.has_permission("delete"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have delete permission"
+            )
+        
+        # Find and validate document ownership
+        document = None
+        doc_key = None
+        for group_id in current_user.groups:
+            potential_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_data = redis_client.get_json(potential_key)
+            if doc_data:
+                document = Document.from_dict(doc_data)
+                doc_key = potential_key
+                break
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        # TODO: Delete associated vector embeddings from LanceDB
+        # This would require implementing a cleanup function in the embedding worker
+        # For now, we'll just delete the metadata
+        
+        # Delete document metadata from Redis
+        if not redis_client.delete(doc_key):
+            logger.warning(f"Failed to delete document metadata for {document_id}")
+        
+        logger.info(f"Deleted document {document_id} for user {current_user.user_id}")
+        
         return {
             "message": "Document deleted successfully",
             "document_id": document_id,
-            "user_id": current_user.user_id
+            "filename": document.filename,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
         }
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Document delete error for user {current_user.user_id}: {e}")
+        logger.error(f"Error deleting document {document_id} for user {current_user.user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document delete service error"
+            detail="Document deletion service error"
         )
 
 
@@ -1047,13 +1118,36 @@ async def submit_query(
                 detail="Query text is required"
             )
         
-        # For now, return mock response
-        # In a real implementation, this would submit to Celery
-        query_id = f"query_{int(time.time())}"
+        # Create query job
+        job = job_manager.create_job(
+            user_id=current_user.user_id,
+            job_type=JobType.QUERY,
+            metadata={
+                "query_text": query_text,
+                "user_id": current_user.user_id
+            }
+        )
+        
+        # Queue query task
+        task = celery_app.send_task(
+            "process_query",
+            args=[
+                job.job_id,
+                current_user.user_id,
+                query_text
+            ],
+            queue="query"
+        )
+        
+        # Update job with task ID
+        job.metadata["celery_task_id"] = task.id
+        redis_client.set_job(job)
+        
+        logger.info(f"Created query job {job.job_id} for user {current_user.user_id}")
         
         return {
-            "query_id": query_id,
-            "status": "processing",
+            "job_id": job.job_id,
+            "status": "queued",
             "message": "Query submitted for processing",
             "user_id": current_user.user_id
         }
@@ -1083,12 +1177,18 @@ async def get_query_result(
         dict: Query result
     """
     try:
-        # For now, return mock result
-        # In a real implementation, this would check job status
+        job = job_manager.get_job(query_id)
+
+        if not job or job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found"
+            )
+
         return {
             "query_id": query_id,
-            "status": "completed",
-            "result": "This is a mock response to your query. In a real implementation, this would contain the actual RAG response with citations.",
+            "status": job.status.value,
+            "result": job.result,
             "user_id": current_user.user_id
         }
     except Exception as e:
@@ -1099,196 +1199,7 @@ async def get_query_result(
         )
 
 
-# Job management endpoints
-@app.get("/api/jobs", tags=["Jobs"])
-async def list_jobs(
-    status: Optional[str] = None,
-    limit: int = 50,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    List user's jobs.
-    
-    Args:
-        status: Filter by job status
-        limit: Maximum number of jobs to return
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: List of jobs
-    """
-    try:
-        # For now, return mock data
-        # In a real implementation, this would query the job manager
-        mock_jobs = [
-            {
-                "job_id": "job1",
-                "job_type": "embedding",
-                "status": "completed",
-                "progress": 1.0,
-                "created_at": "2024-01-01T10:00:00Z"
-            },
-            {
-                "job_id": "job2",
-                "job_type": "query", 
-                "status": "processing",
-                "progress": 0.5,
-                "created_at": "2024-01-01T11:00:00Z"
-            }
-        ]
-        
-        return {
-            "jobs": mock_jobs,
-            "total": len(mock_jobs),
-            "user_id": current_user.user_id
-        }
-    except Exception as e:
-        logger.error(f"Jobs list error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Jobs service error"
-        )
 
-
-@app.delete("/api/jobs/{job_id}", tags=["Jobs"])
-async def cancel_job(
-    job_id: str,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Cancel a job.
-    
-    Args:
-        job_id: ID of job to cancel
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Cancellation result
-    """
-    try:
-        # For now, return success
-        # In a real implementation, this would cancel the Celery job
-        return {
-            "message": "Job cancelled successfully",
-            "job_id": job_id,
-            "user_id": current_user.user_id
-        }
-    except Exception as e:
-        logger.error(f"Job cancel error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Job cancel service error"
-        )
-
-
-@app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
-async def login(
-    request: Request,
-    login_data: LoginRequest,
-    rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 300))  # 5 attempts per 5 minutes
-):
-    """
-    Authenticate user and create session.
-    
-    Args:
-        request: FastAPI request object
-        login_data: Login credentials
-        rate_limit: Rate limiting dependency
-    
-    Returns:
-        LoginResponse: Authentication token and user info
-    
-    Raises:
-        HTTPException: If authentication fails
-    """
-    try:
-        # Authenticate user
-        auth_result = auth_manager.authenticate_user(
-            username=login_data.username,
-            password=login_data.password
-        )
-        
-        logger.info(f"User {login_data.username} logged in successfully")
-        
-        return LoginResponse(
-            access_token=auth_result["access_token"],
-            token_type=auth_result["token_type"],
-            user_id=auth_result["user_id"],
-            groups=auth_result["groups"]
-        )
-    
-    except InvalidCredentialsError:
-        logger.warning(f"Invalid login attempt for user {login_data.username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    except AuthenticationError as e:
-        logger.error(f"Authentication error for user {login_data.username}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication service error"
-        )
-    
-    except Exception as e:
-        logger.error(f"Unexpected login error for user {login_data.username}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login service temporarily unavailable"
-        )
-
-
-@app.post("/api/auth/logout", tags=["Authentication"])
-async def logout(
-    request: Request,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Logout user and invalidate session.
-    
-    Args:
-        request: FastAPI request object
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Logout confirmation
-    """
-    try:
-        # Get token from request headers
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid authorization header"
-            )
-        
-        token = auth_header.split(" ")[1]
-        
-        # Logout user
-        success = auth_manager.logout_user(token)
-        
-        if success:
-            logger.info(f"User {current_user.user_id} logged out successfully")
-            return {
-                "message": "Logged out successfully",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Logout failed"
-            )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Logout error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Logout service error"
-        )
 
 
 @app.get("/api/auth/session", tags=["Authentication"])
@@ -1494,19 +1405,26 @@ async def upload_documents(
                     detail=f"Unsupported file format: {file.filename}. Supported formats: {supported_formats}"
                 )
             
-            # Validate file size (max 50MB per file)
-            if file.size and file.size > 50 * 1024 * 1024:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File too large: {file.filename}. Maximum size is 50MB"
-                )
-            
-            # Save file to temporary location
+            # Save file to temporary location and validate size against config
             temp_file_path = Path(temp_dir) / file.filename
             try:
                 with open(temp_file_path, "wb") as buffer:
                     shutil.copyfileobj(file.file, buffer)
+                # Validate file size (max from config)
+                file_size = os.path.getsize(temp_file_path)
+                if file_size > config.MAX_FILE_SIZE:
+                    # Cleanup oversized file immediately
+                    try:
+                        os.remove(temp_file_path)
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File too large: {file.filename}. Maximum size is {int(config.MAX_FILE_SIZE/(1024*1024))}MB"
+                    )
                 temp_files.append(str(temp_file_path))
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Failed to save uploaded file {file.filename}: {e}")
                 raise HTTPException(
@@ -1528,12 +1446,15 @@ async def upload_documents(
         )
         
         # Queue embedding task
-        from ..workers.embedding_worker import process_document_embedding
-        task = process_document_embedding.delay(
-            job_id=job.job_id,
-            user_id=current_user.user_id,
-            group_id=group_id,
-            file_paths=temp_files
+        task = celery_app.send_task(
+            "process_document_embedding",
+            args=[
+                job.job_id,
+                current_user.user_id,
+                group_id,
+                temp_files
+            ],
+            queue="embedding"
         )
         
         # Update job with task ID
@@ -1830,8 +1751,245 @@ async def get_document_status(
         )
 
 
+
 # Job management endpoints
 from ..shared.job_manager import job_manager, JobType, JobStatus
+
+@app.get("/api/jobs", tags=["Jobs"])
+async def list_jobs(
+    request: Request,
+    job_type: Optional[str] = None,
+    status: Optional[str] = None,
+    active_only: bool = False,
+    limit: int = 50,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    List user's jobs with filtering.
+    
+    Args:
+        request: FastAPI request object
+        job_type: Optional job type filter (embedding, query)
+        status: Optional status filter
+        active_only: If True, only return non-finished jobs
+        limit: Maximum number of jobs to return
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: List of jobs with metadata
+    """
+    try:
+        # Parse job type filter
+        job_type_filter = None
+        if job_type:
+            try:
+                job_type_filter = JobType(job_type.lower())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid job type: {job_type}. Valid types: {[t.value for t in JobType]}"
+                )
+        
+        # Parse status filter
+        status_filter = None
+        if status:
+            try:
+                status_filter = JobStatus(status.lower())
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid status: {status}. Valid statuses: {[s.value for s in JobStatus]}"
+                )
+        
+        # Get user jobs
+        jobs = job_manager.get_user_jobs(
+            user_id=current_user.user_id,
+            job_type=job_type_filter,
+            status=status_filter,
+            active_only=active_only,
+            limit=limit
+        )
+        
+        # Convert to dict format
+        job_list = []
+        for job in jobs:
+            job_dict = job.to_dict()
+            # Add estimated completion time for processing jobs
+            if job.status == JobStatus.PROCESSING and job.progress > 0:
+                try:
+                    elapsed = (datetime.now() - job.started_at).total_seconds()
+                    estimated_total = elapsed / job.progress
+                    remaining = estimated_total - elapsed
+                    if remaining > 0:
+                        completion_time = datetime.now().timestamp() + remaining
+                        job_dict["estimated_completion"] = datetime.fromtimestamp(completion_time).isoformat()
+                except Exception:
+                    pass  # Skip if calculation fails
+            
+            job_list.append(job_dict)
+        
+        return {
+            "jobs": job_list,
+            "total_count": len(job_list),
+            "filters": {
+                "job_type": job_type,
+                "status": status,
+                "active_only": active_only
+            }
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing jobs for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job listing service error"
+        )
+
+
+@app.get("/api/jobs/{job_id}", tags=["Jobs"])
+async def get_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user)
+):
+    """
+    Get specific job details.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Job details
+    
+    Raises:
+        HTTPException: If job not found or access denied
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Verify job ownership
+        if job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to job"
+            )
+        
+        job_dict = job.to_dict()
+        
+        # Add additional computed fields
+        if job.status == JobStatus.PROCESSING and job.progress > 0:
+            try:
+                elapsed = (datetime.now() - job.started_at).total_seconds()
+                estimated_total = elapsed / job.progress
+                remaining = estimated_total - elapsed
+                if remaining > 0:
+                    completion_time = datetime.now().timestamp() + remaining
+                    job_dict["estimated_completion"] = datetime.fromtimestamp(completion_time).isoformat()
+            except Exception:
+                pass
+        
+        # Add duration for completed jobs
+        duration = job.get_duration()
+        if duration is not None:
+            job_dict["duration_seconds"] = duration
+        
+        return job_dict
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job {job_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job retrieval service error"
+        )
+
+
+@app.post("/api/jobs/{job_id}/cancel", tags=["Jobs"])
+async def cancel_job(
+    job_id: str,
+    current_user: UserSession = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 cancellations per 5 minutes
+):
+    """
+    Cancel a job.
+    
+    Args:
+        job_id: Job identifier
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Cancellation confirmation
+    
+    Raises:
+        HTTPException: If job not found, access denied, or cancellation fails
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Verify job ownership
+        if job.user_id != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to job"
+            )
+        
+        # Check if job can be cancelled
+        if job.status not in [JobStatus.PENDING, JobStatus.PROCESSING]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot cancel job with status: {job.status.value}"
+            )
+        
+        # Cancel the job
+        success = job_manager.cancel_job(job_id, reason="Cancelled by user")
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to cancel job"
+            )
+        
+        # Try to cancel the Celery task if it exists
+        celery_task_id = job.metadata.get("celery_task_id")
+        if celery_task_id:
+            try:
+                celery_app.control.revoke(celery_task_id, terminate=True)
+                logger.info(f"Revoked Celery task {celery_task_id} for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to revoke Celery task {celery_task_id}: {e}")
+        
+        logger.info(f"Cancelled job {job_id} for user {current_user.user_id}")
+        
+        return {
+            "message": "Job cancelled successfully",
+            "job_id": job_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling job {job_id} for user {current_user.user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job cancellation service error"
+        )
 
 @app.get("/api/jobs", tags=["Jobs"])
 async def list_jobs(

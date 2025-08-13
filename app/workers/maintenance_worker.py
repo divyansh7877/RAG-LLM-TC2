@@ -166,3 +166,18 @@ def worker_health_report():
         except:
             pass
         raise
+
+@celery_app.task(name="cleanup_query_cache")
+def cleanup_query_cache():
+    """
+    Periodically clean up the query engine cache to free up resources.
+    """
+    from ..shared.query_engine_factory import query_engine_factory
+    
+    try:
+        query_engine_factory.cleanup()
+        logger.info("Query engine cache cleanup successful.")
+        return {"status": "SUCCESS"}
+    except Exception as e:
+        logger.error(f"Failed to cleanup query cache: {e}", exc_info=True)
+        raise

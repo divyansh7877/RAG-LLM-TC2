@@ -13,6 +13,8 @@ class RAGApp {
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 1000;
         this.selectedFiles = [];
+        this.jobsRefreshIntervalId = null;
+        this.jobsAutoRefreshDelay = 5000;
 
         // Supported file types and their MIME types
         this.supportedFileTypes = {
@@ -209,8 +211,6 @@ class RAGApp {
         }
 
         const uploadProgress = document.getElementById('uploadProgress');
-        const progressFill = document.getElementById('progressFill');
-        const progressText = document.getElementById('progressText');
         const uploadBtn = document.getElementById('uploadBtn');
 
         if (uploadProgress) uploadProgress.style.display = 'block';
@@ -237,27 +237,11 @@ class RAGApp {
             }
 
             const result = await response.json();
-
-            // Simulate progress (real progress would come from WebSocket)
-            let progress = 0;
-            const progressInterval = setInterval(() => {
-                progress += 10;
-                if (progressFill) progressFill.style.width = `${progress}%`;
-                if (progressText) progressText.textContent = `${progress}%`;
-
-                if (progress >= 100) {
-                    clearInterval(progressInterval);
-                    this.showToast('success', 'Upload Complete',
-                        `Successfully uploaded ${result.files_count || this.selectedFiles.length} files`);
-
-                    // Reset form
-                    this.resetUploadForm();
-
-                    // Refresh documents and jobs
-                    this.loadDocuments();
-                    this.loadJobs();
-                }
-            }, 200);
+            this.showToast('success', 'Upload Started',
+                `Started processing ${result.files_count || this.selectedFiles.length} files. Monitor progress in the Jobs tab.`);
+            this.resetUploadForm();
+            this.loadJobs();
+            this.switchTab('jobs');
 
         } catch (error) {
             console.error('Upload error:', error);
@@ -315,9 +299,9 @@ class RAGApp {
             }
 
             const result = await response.json();
-
-            // Poll for results (real updates would come from WebSocket)
-            this.pollQueryResult(result.query_id);
+            this.showToast('success', 'Query Submitted', `Query submitted successfully. You will be notified upon completion.`);
+            if (submitBtn) submitBtn.disabled = false;
+            if (queryInput) queryInput.value = '';
 
         } catch (error) {
             console.error('Query error:', error);
@@ -327,59 +311,7 @@ class RAGApp {
         }
     }
 
-    async pollQueryResult(queryId) {
-        const maxAttempts = 30; // 30 seconds timeout
-        let attempts = 0;
-
-        const poll = async () => {
-            try {
-                const response = await fetch(`${this.apiBase}/query/${queryId}`, {
-                    headers: {
-                        'Authorization': `Bearer ${this.token}`
-                    }
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to get query status');
-                }
-
-                const result = await response.json();
-                const queryStatus = document.getElementById('queryStatus');
-                const queryResponse = document.getElementById('queryResponse');
-                const submitBtn = document.getElementById('submitQueryBtn');
-
-                if (result.status === 'completed') {
-                    if (queryResponse) queryResponse.innerHTML = result.result || 'No results found';
-                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
-                    if (submitBtn) submitBtn.disabled = false;
-                    return;
-                } else if (result.status === 'failed') {
-                    if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${result.error || 'Unknown error'}</div>`;
-                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
-                    if (submitBtn) submitBtn.disabled = false;
-                    return;
-                } else if (attempts < maxAttempts) {
-                    attempts++;
-                    setTimeout(poll, 1000);
-                } else {
-                    if (queryResponse) queryResponse.innerHTML = '<div class="error-message">Query timeout</div>';
-                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Timeout';
-                    if (submitBtn) submitBtn.disabled = false;
-                }
-            } catch (error) {
-                console.error('Polling error:', error);
-                const queryResponse = document.getElementById('queryResponse');
-                const queryStatus = document.getElementById('queryStatus');
-                const submitBtn = document.getElementById('submitQueryBtn');
-
-                if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Error checking query status: ${error.message}</div>`;
-                if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Error';
-                if (submitBtn) submitBtn.disabled = false;
-            }
-        };
-
-        poll();
-    }
+    
 
     async handleLogin(e) {
         e.preventDefault();
@@ -538,8 +470,14 @@ class RAGApp {
         const groupSelect = document.getElementById('groupSelect');
         const groupFilter = document.getElementById('groupFilter');
 
+        const personalOption = document.createElement('option');
+        // Use canonical group id for personal scope
+        personalOption.value = 'personal';
+        personalOption.textContent = 'Personal';
+
         if (groupSelect) {
             groupSelect.innerHTML = '<option value="">Select a group...</option>';
+            groupSelect.appendChild(personalOption.cloneNode(true));
             this.user.groups.forEach(group => {
                 const option = document.createElement('option');
                 option.value = group;
@@ -550,6 +488,7 @@ class RAGApp {
 
         if (groupFilter) {
             groupFilter.innerHTML = '<option value="">All Groups</option>';
+            groupFilter.appendChild(personalOption.cloneNode(true));
             this.user.groups.forEach(group => {
                 const option = document.createElement('option');
                 option.value = group;
@@ -579,6 +518,9 @@ class RAGApp {
             this.loadDocuments();
         } else if (tabName === 'jobs') {
             this.loadJobs();
+            this.startJobsAutoRefresh();
+        } else {
+            this.stopJobsAutoRefresh();
         }
     }
 
@@ -885,11 +827,34 @@ class RAGApp {
                 // Handle pong response to ping - just update connection status
                 console.log('Received pong from server');
                 break;
+            case 'job_notification': {
+                // Backend sends job details under message.job
+                if (message.job) {
+                    this.handleJobUpdate({
+                        job_id: message.job.job_id,
+                        status: message.job.status,
+                        progress: message.job.progress
+                    });
+                }
+                break;
+            }
+            case 'job_progress': {
+                // Lightweight progress update
+                this.handleJobUpdate({
+                    job_id: message.job_id,
+                    status: 'processing',
+                    progress: message.progress
+                });
+                break;
+            }
             case 'job_update':
                 this.handleJobUpdate(message.data);
                 break;
             case 'notification':
                 this.showToast(message.data.level, message.data.title, message.data.message);
+                break;
+            case 'query_result':
+                this.handleQueryResult(message.data);
                 break;
             case 'error':
                 console.error('WebSocket error:', message.error);
@@ -921,6 +886,52 @@ class RAGApp {
                 statusElement.className = `document-status status-${jobData.status}`;
                 statusElement.innerHTML = `${this.getStatusIcon(jobData.status)} ${jobData.status}`;
             }
+        }
+
+        if (jobData.status === 'completed' || jobData.status === 'failed') {
+            this.loadDocuments();
+            this.loadJobs();
+            // Stop auto-refresh if no active jobs remain
+            setTimeout(() => this.maybeStopJobsAutoRefresh(), 0);
+        }
+    }
+
+    startJobsAutoRefresh() {
+        this.stopJobsAutoRefresh();
+        this.jobsRefreshIntervalId = setInterval(async () => {
+            try {
+                await this.loadJobs();
+                this.maybeStopJobsAutoRefresh();
+            } catch (_) {}
+        }, this.jobsAutoRefreshDelay);
+    }
+
+    stopJobsAutoRefresh() {
+        if (this.jobsRefreshIntervalId) {
+            clearInterval(this.jobsRefreshIntervalId);
+            this.jobsRefreshIntervalId = null;
+        }
+    }
+
+    maybeStopJobsAutoRefresh() {
+        const jobsList = document.getElementById('jobsList');
+        if (!jobsList) return;
+        const hasActive = Array.from(jobsList.querySelectorAll('.job-card .document-status')).some(el => {
+            return el.classList.contains('status-processing') || el.classList.contains('status-pending');
+        });
+        if (!hasActive) this.stopJobsAutoRefresh();
+    }
+
+    handleQueryResult(data) {
+        const queryResponse = document.getElementById('queryResponse');
+        const queryStatus = document.getElementById('queryStatus');
+
+        if (data.status === 'completed') {
+            if (queryResponse) queryResponse.innerHTML = data.result || 'No results found';
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
+        } else if (data.status === 'failed') {
+            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${data.error || 'Unknown error'}</div>`;
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
         }
     }
 

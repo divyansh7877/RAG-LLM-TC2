@@ -1,166 +1,91 @@
 #!/usr/bin/env python3
 """
-Embedding optimization utilities to improve performance and avoid warnings.
+Embedding model management and optimization.
+
+This module provides a thread-safe singleton for the embedding model to ensure it is
+loaded only once per worker process, which is critical for performance and memory usage.
 """
 import os
 import logging
-from typing import Optional
+import threading
+from typing import Dict
+
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 logger = logging.getLogger(__name__)
 
-def set_optimal_threading_environment():
-    """Set environment variables for optimal threading performance."""
-    # Prevent OpenBLAS threading issues that cause warnings
-    threading_vars = {
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1", 
-        "MKL_NUM_THREADS": "1",
-        "VECLIB_MAXIMUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "TOKENIZERS_PARALLELISM": "false",  # Avoid tokenizer warnings
-    }
-    
-    for var, value in threading_vars.items():
-        os.environ[var] = value
-        
-    logger.debug(f"Set threading environment variables: {threading_vars}")
+# --- Thread-safe Singleton for Embedding Model ---
+class EmbeddingModelSingleton:
+    _instance: HuggingFaceEmbedding = None
+    _lock = threading.Lock()
 
-def configure_torch_for_cpu():
-    """Configure PyTorch for optimal CPU performance."""
-    try:
-        import torch
-        
-        # Set single thread for CPU inference to avoid conflicts
-        torch.set_num_threads(1)
-        
-        # Disable gradient computation for inference
-        torch.set_grad_enabled(False)
-        
-        # Use deterministic algorithms for reproducibility
-        if hasattr(torch, 'use_deterministic_algorithms'):
-            torch.use_deterministic_algorithms(True, warn_only=True)
-            
-        logger.debug("Configured PyTorch for optimal CPU performance")
-        
-    except ImportError:
-        logger.warning("PyTorch not available, skipping torch configuration")
+    @classmethod
+    def get_instance(cls, model_name: str, device: str) -> HuggingFaceEmbedding:
+        """
+        Get the singleton instance of the embedding model.
+        Initializes the model on the first call.
+        """
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    logger.info(f"Initializing embedding model singleton: {model_name} on {device}")
+                    cls._instance = cls._create_optimized_model(model_name, device)
+        return cls._instance
 
-def create_optimized_embedding_model(
-    model_name: str = "./models/gte-large-en-v1.5",
-    device: str = "cpu",
-    batch_size: int = 8,
-    max_length: int = 512
-) -> HuggingFaceEmbedding:
-    """
-    Create an optimized HuggingFace embedding model.
-    
-    Args:
-        model_name: Path or name of the embedding model
-        device: Device to use ('cpu' or 'cuda')
-        batch_size: Batch size for embedding generation
-        max_length: Maximum sequence length
-        
-    Returns:
-        Optimized HuggingFaceEmbedding instance
-    """
-    # Set optimal environment
-    set_optimal_threading_environment()
-    
-    if device == "cpu":
-        configure_torch_for_cpu()
-    
-    # Create embedding model with optimized settings
-    embed_model = HuggingFaceEmbedding(
-        model_name=model_name,
-        device=device,
-        trust_remote_code=True,
-        embed_batch_size=batch_size,
-        max_length=max_length,
-        # Additional optimizations
-        normalize=True,  # Normalize embeddings for better similarity search
-        query_instruction="",  # No special query instruction needed
-        text_instruction="",   # No special text instruction needed
-    )
-    
-    logger.info(f"Created optimized embedding model: {model_name} on {device}")
-    logger.info(f"Settings: batch_size={batch_size}, max_length={max_length}")
-    
-    return embed_model
+    @staticmethod
+    def _create_optimized_model(model_name: str, device: str) -> HuggingFaceEmbedding:
+        """
+        Create an optimized HuggingFace embedding model with specific settings.
+        """
+        # Set environment variables for optimal threading performance
+        threading_vars = {
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+        for var, value in threading_vars.items():
+            os.environ[var] = value
 
-def get_embedding_model_singleton(
-    model_name: str = "./models/gte-large-en-v1.5",
-    device: str = "cpu"
-) -> HuggingFaceEmbedding:
-    """
-    Get a singleton instance of the embedding model for reuse.
-    
-    This avoids reloading the model multiple times and improves performance.
-    """
-    # Use a simple class attribute to store the singleton
-    if not hasattr(get_embedding_model_singleton, '_model'):
-        get_embedding_model_singleton._model = None
-        get_embedding_model_singleton._model_name = None
-        get_embedding_model_singleton._device = None
-    
-    # Check if we need to create a new model
-    if (get_embedding_model_singleton._model is None or 
-        get_embedding_model_singleton._model_name != model_name or
-        get_embedding_model_singleton._device != device):
-        
-        logger.info(f"Creating new embedding model singleton: {model_name} on {device}")
-        get_embedding_model_singleton._model = create_optimized_embedding_model(
+        # Configure PyTorch for CPU if needed
+        if device == "cpu":
+            try:
+                import torch
+                torch.set_num_threads(1)
+                torch.set_grad_enabled(False)
+            except ImportError:
+                logger.warning("PyTorch not available, skipping CPU optimization.")
+
+        # Create the model with optimized settings
+        return HuggingFaceEmbedding(
             model_name=model_name,
             device=device,
-            batch_size=8,  # Conservative batch size for singleton
-            max_length=512
+            trust_remote_code=True,
+            embed_batch_size=16,  # A reasonable default batch size
+            max_length=512,
+            normalize=True,
         )
-        get_embedding_model_singleton._model_name = model_name
-        get_embedding_model_singleton._device = device
-    
-    return get_embedding_model_singleton._model
 
-def optimize_for_batch_processing(batch_size: int) -> dict:
+def get_embedding_model(model_name: str, device: str) -> HuggingFaceEmbedding:
+    """Public function to access the embedding model singleton."""
+    return EmbeddingModelSingleton.get_instance(model_name, device)
+
+def optimize_for_batch_processing(node_count: int) -> Dict[str, int]:
     """
-    Get optimal settings for batch processing based on batch size.
+    Get optimal settings for batch processing based on the number of nodes.
+    This helps manage memory and improve throughput.
     
     Args:
-        batch_size: Number of items to process in batch
+        node_count: The total number of nodes to be processed.
         
     Returns:
-        Dictionary with optimal settings
+        A dictionary with optimal settings for embedding and node processing.
     """
-    if batch_size <= 8:
-        return {
-            "embed_batch_size": min(batch_size, 4),
-            "max_length": 512,
-            "node_batch_size": 8
-        }
-    elif batch_size <= 32:
-        return {
-            "embed_batch_size": 8,
-            "max_length": 512,
-            "node_batch_size": 16
-        }
+    if node_count <= 32:
+        return {"embed_batch_size": 8, "node_batch_size": 32}
+    elif node_count <= 128:
+        return {"embed_batch_size": 16, "node_batch_size": 64}
     else:
-        return {
-            "embed_batch_size": 16,
-            "max_length": 384,  # Shorter sequences for large batches
-            "node_batch_size": 32
-        }
-
-def cleanup_embedding_resources():
-    """Clean up embedding model resources."""
-    if hasattr(get_embedding_model_singleton, '_model'):
-        if get_embedding_model_singleton._model is not None:
-            # Clear the model from memory
-            del get_embedding_model_singleton._model
-            get_embedding_model_singleton._model = None
-            get_embedding_model_singleton._model_name = None
-            get_embedding_model_singleton._device = None
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            logger.info("Cleaned up embedding model resources")
+        return {"embed_batch_size": 32, "node_batch_size": 128}

@@ -6,7 +6,7 @@ llama-index-vector-stores-lancedb
 llama-index-llms-llama-cpp
 sentence-transformers
 torch
-PyMuPDF
+docling
 # New dependencies for concurrent RAG optimization
 fastapi
 uvicorn[standard]
@@ -19,3 +19,4 @@ passlib[bcrypt]
 pydantic
 aiofiles
 psutil
+flower
