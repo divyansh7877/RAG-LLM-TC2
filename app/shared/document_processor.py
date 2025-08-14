@@ -39,12 +39,17 @@ class EmbeddingResult:
 class DocumentProcessor:
     """A service to process and embed documents into a vector store."""
     
-    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings", embed_model_name: str = "./models/gte-large-en-v1.5", device: str = "cpu"):
+    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings", embed_model_name: str = "./models/gte-large-en-v1.5", device: Optional[str] = None):
         self.logger = StructuredLogger(__name__)
         self.db_path = db_path
         self.table_name = table_name
         self.embed_model_name = embed_model_name
-        self.device = device
+        # Resolve device from config when not explicitly provided
+        try:
+            from .config import config as _config
+            self.device = device or ("cuda" if _config.HAS_CUDA else "cpu")
+        except Exception:
+            self.device = device or "cpu"
         self.db = None
         self.vector_store = None
 
@@ -74,10 +79,21 @@ class DocumentProcessor:
         # 1. Load the embedding model for this operation
         embed_model = get_embedding_model(self.embed_model_name, self.device)
 
-        # 2. Filter out unsupported or non-existent files
-        valid_files = [fp for fp in file_paths if os.path.exists(fp) and is_supported_format(fp)]
+        # 2. Normalize paths and filter out non-existent files (format was validated at upload)
+        normalized_files = [os.path.abspath(fp) for fp in file_paths]
+        valid_files = []
+        for fp in normalized_files:
+            exists = os.path.exists(fp)
+            ext = os.path.splitext(fp)[1].lower()
+            if not exists:
+                self.logger.warning(f"Input file not found, skipping: {fp}")
+                continue
+            # We already validated allowed extensions in the API; proceed regardless here
+            valid_files.append(fp)
         if not valid_files:
+            self.logger.error("No valid document files after existence check.")
             return EmbeddingResult(False, 0, 0, 0.0, "No valid document files provided.")
+        # (the previous early return already handles 'no valid files')
 
         # 3. Build nodes from documents
         nodes = self._build_nodes(valid_files, user_id, group_id, chunk_size, chunk_overlap)
@@ -136,15 +152,39 @@ class DocumentProcessor:
     def _embed_and_store(self, nodes: List[Document], embed_model):
         """
         Embeds the given nodes and stores them in LanceDB, using an explicit embed model.
+        Applies simple batching for memory stability on large inputs.
         """
         total_nodes = len(nodes)
         self.logger.info(f"Embedding {total_nodes} nodes.")
 
-        # Use the provided embedding model
-        storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
-        index = VectorStoreIndex(nodes, embed_model=embed_model, storage_context=storage_context)
+        # Determine batching strategy
+        batch_cfg = optimize_for_batch_processing(total_nodes)
+        node_batch_size = batch_cfg.get("node_batch_size", 64)
 
-        self.logger.info(f"Successfully stored {total_nodes} new vectors.")
+        # Storage context with existing vector store
+        storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+
+        if total_nodes <= node_batch_size:
+            VectorStoreIndex(nodes, embed_model=embed_model, storage_context=storage_context)
+            self.logger.info(f"Successfully stored {total_nodes} new vectors.")
+            return
+
+        # Batched insertion for large corpora
+        index = None
+        num_batches = (total_nodes + node_batch_size - 1) // node_batch_size
+        for batch_idx in range(0, total_nodes, node_batch_size):
+            batch_nodes = nodes[batch_idx: batch_idx + node_batch_size]
+            human_batch = (batch_idx // node_batch_size) + 1
+            self.logger.info(
+                f"Processing batch {human_batch}/{num_batches}: nodes {batch_idx+1}-{min(batch_idx+len(batch_nodes), total_nodes)}"
+            )
+
+            if index is None:
+                index = VectorStoreIndex(batch_nodes, embed_model=embed_model, storage_context=storage_context)
+            else:
+                index.insert_nodes(batch_nodes)
+
+        self.logger.info(f"Successfully stored {total_nodes} new vectors (batched).")
 
     def _calculate_file_hash(self, file_path: str) -> str:
         """Calculate SHA-256 hash of a file's content for deduplication."""

@@ -13,13 +13,10 @@ from datetime import datetime
 
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
 
 # --- Module-level Singleton for Docling Converter ---
-# This is more efficient than initializing on every call.
-# It's configured to use the CPU for OCR to avoid multiprocessing issues with CUDA.
-PDF_OPTIONS = PdfPipelineOptions(use_gpu=False)
-DOCUMENT_CONVERTER = DocumentConverter(format_options={InputFormat.PDF: PDF_OPTIONS})
+# Use library defaults to avoid version-specific option schema issues
+DOCUMENT_CONVERTER = DocumentConverter()
 
 # --- Supported Formats ---
 SUPPORTED_FORMATS = {
@@ -61,19 +58,23 @@ def extract_text_from_document(file_path: str) -> List[Tuple[str, int]]:
     try:
         result = DOCUMENT_CONVERTER.convert(file_path)
         doc = result.document
-        
-        # Use markdown export for consistent structure, with fallback to page-by-page text.
-        if hasattr(doc, 'export_to_markdown') and doc.export_to_markdown():
-            return [(doc.export_to_markdown(), 1)]
-        
+
+        if hasattr(doc, 'export_to_markdown'):
+            try:
+                md = doc.export_to_markdown()
+                if md:
+                    return [(md, 1)]
+            except Exception:
+                pass
+
         if hasattr(doc, 'pages') and doc.pages:
-            return [(page.text, i + 1) for i, page in enumerate(doc.pages) if hasattr(page, 'text')]
-            
+            return [(getattr(page, 'text', '') or '', i + 1) for i, page in enumerate(doc.pages)]
+
         if hasattr(doc, 'text') and doc.text:
             return [(doc.text, 1)]
 
-        return [] # Return empty list if no text could be extracted
-        
+        return []
+
     except Exception as e:
         raise RuntimeError(f"Docling failed to extract text from {file_path}: {e}") from e
 

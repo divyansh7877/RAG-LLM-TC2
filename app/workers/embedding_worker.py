@@ -91,21 +91,36 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
 
     except Exception as e:
         logger.error(f"Embedding job {job_id} failed: {e}", exc_info=True)
-        job_manager.update_job_status(job_id, JobStatus.FAILED, error=str(e))
-        # Cleanup temp upload dir on failure as well
+
+        # Determine if Celery will retry this task
+        will_retry = False
         try:
-            job = redis_client.get_job(job_id)
-            temp_dir = job.metadata.get("temp_dir") if job and job.metadata else None
-            if temp_dir and os.path.isdir(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            current_retries = getattr(self.request, "retries", 0)
+            max_retries = getattr(self, "max_retries", 0)
+            will_retry = current_retries < max_retries
         except Exception:
-            pass
+            will_retry = False
+
+        if will_retry:
+            # Do NOT mark as FAILED yet; keep job in processing and retain temp files for retry
+            job_manager.update_job_progress(job_id, 0.05, f"Retrying after error: {str(e)}")
+        else:
+            # Final failure: mark failed and cleanup temp upload directory
+            job_manager.update_job_status(job_id, JobStatus.FAILED, error=str(e))
+            try:
+                job = redis_client.get_job(job_id)
+                temp_dir = job.metadata.get("temp_dir") if job and job.metadata else None
+                if temp_dir and os.path.isdir(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         try:
             import asyncio
             asyncio.run(job_notification_service.broadcast_progress_update(job_id))
         except Exception:
             pass
-        # The task will be retried automatically by Celery based on the decorator config
+        # Re-raise to allow Celery autoretry/final failure handling
         raise
 
 

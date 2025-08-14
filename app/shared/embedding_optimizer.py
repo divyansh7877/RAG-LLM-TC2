@@ -8,9 +8,10 @@ loaded only once per worker process, which is critical for performance and memor
 import os
 import logging
 import threading
-from typing import Dict
+from typing import Dict, Optional
 
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from .config import config
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +21,17 @@ class EmbeddingModelSingleton:
     _lock = threading.Lock()
 
     @classmethod
-    def get_instance(cls, model_name: str, device: str) -> HuggingFaceEmbedding:
+    def get_instance(cls, model_name: str, device: Optional[str] = None) -> HuggingFaceEmbedding:
         """
         Get the singleton instance of the embedding model.
         Initializes the model on the first call.
         """
+        resolved_device = device or ("cuda" if config.HAS_CUDA else "cpu")
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    logger.info(f"Initializing embedding model singleton: {model_name} on {device}")
-                    cls._instance = cls._create_optimized_model(model_name, device)
+                    logger.info(f"Initializing embedding model singleton: {model_name} on {resolved_device}")
+                    cls._instance = cls._create_optimized_model(model_name, resolved_device)
         return cls._instance
 
     @staticmethod
@@ -57,6 +59,14 @@ class EmbeddingModelSingleton:
                 torch.set_grad_enabled(False)
             except ImportError:
                 logger.warning("PyTorch not available, skipping CPU optimization.")
+        else:
+            # Optional CUDA-specific tweaks
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.backends.cuda.matmul.allow_tf32 = True  # modest perf boost on Ampere+
+            except Exception:
+                pass
 
         # Create the model with optimized settings
         return HuggingFaceEmbedding(
@@ -68,7 +78,7 @@ class EmbeddingModelSingleton:
             normalize=True,
         )
 
-def get_embedding_model(model_name: str, device: str) -> HuggingFaceEmbedding:
+def get_embedding_model(model_name: str, device: Optional[str] = None) -> HuggingFaceEmbedding:
     """Public function to access the embedding model singleton."""
     return EmbeddingModelSingleton.get_instance(model_name, device)
 
