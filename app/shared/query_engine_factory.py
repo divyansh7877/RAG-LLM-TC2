@@ -9,7 +9,7 @@ import os
 import multiprocessing as mp
 import threading
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -81,6 +81,11 @@ class QueryEngineFactory:
         self._llm = None
         self._vector_store = None
         self._index = None
+        # Simple in-process cache for query results
+        self._query_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_ttl_seconds: int = 3600
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
         self.logger = StructuredLogger(__name__)
     
     def _get_embed_model(self):
@@ -142,8 +147,16 @@ class QueryEngineFactory:
                     )
         return self._index
     
-    def create_query_engine(self, user_filters: MetadataFilters = None):
-        """Create a new query engine instance with optional user filters."""
+    def create_query_engine(
+        self,
+        user_filters: Optional[MetadataFilters] = None,
+        user_id: Optional[str] = None,
+        group_ids: Optional[List[str]] = None,
+    ):
+        """Create a new query engine instance with optional user filters.
+
+        Accepts either a pre-built `user_filters` or a `user_id` with `group_ids`.
+        """
         # Get the shared components
         embed_model = self._get_embed_model()
         llm = self._get_llm()
@@ -156,8 +169,18 @@ class QueryEngineFactory:
             search_type="similarity",
         )
         
-        # Apply user filters if provided
-        if user_filters:
+        # Build filters if user_id/group_ids provided
+        if user_filters is None and user_id is not None:
+            try:
+                user_filter = ExactMatchFilter(key="user_id", value=user_id)
+                group_filters = [ExactMatchFilter(key="group_id", value=gid) for gid in (group_ids or [])]
+                all_filters = [user_filter] + group_filters
+                user_filters = MetadataFilters(filters=all_filters, condition="or")
+            except Exception as e:
+                self.logger.error(f"Failed to build user filters: {e}")
+
+        # Apply filters if available
+        if user_filters is not None:
             retriever.vector_store_kwargs = {"filters": user_filters}
         
         # Create reranker
@@ -178,6 +201,37 @@ class QueryEngineFactory:
             node_postprocessors=[reranker],
             response_synthesizer=response_synthesizer,
         )
+
+    # -----------------------------------------------------------------------
+    # Simple query result cache helpers
+    # -----------------------------------------------------------------------
+    def _make_cache_key(self, user_id: str, group_ids: List[str], query_text: str) -> str:
+        import hashlib
+        normalized_groups = ",".join(sorted(group_ids or []))
+        payload = f"u:{user_id}|g:{normalized_groups}|q:{query_text.strip()}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def get_cached_query_result(self, user_id: str, group_ids: List[str], query_text: str) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        cache_key = self._make_cache_key(user_id, group_ids, query_text)
+        with self._lock:
+            entry = self._query_cache.get(cache_key)
+            if not entry:
+                self._cache_misses += 1
+                return None
+            ts, value = entry
+            if now - ts > self._cache_ttl_seconds:
+                # expired
+                self._query_cache.pop(cache_key, None)
+                self._cache_misses += 1
+                return None
+            self._cache_hits += 1
+            return value
+
+    def cache_query_result(self, user_id: str, group_ids: List[str], query_text: str, result: Dict[str, Any]) -> None:
+        cache_key = self._make_cache_key(user_id, group_ids, query_text)
+        with self._lock:
+            self._query_cache[cache_key] = (time.time(), result)
     
     def health_check(self) -> Dict[str, Any]:
         """Check the health of the query engine factory."""
@@ -208,15 +262,24 @@ class QueryEngineFactory:
     
     def get_factory_stats(self) -> Dict[str, Any]:
         """Get statistics about the query engine factory."""
-        return {
-            "models_initialized": {
-                "embedding_model": self._embed_model is not None,
-                "llm": self._llm is not None,
-                "vector_store": self._vector_store is not None,
-                "index": self._index is not None
-            },
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
+        with self._lock:
+            cache_size = len(self._query_cache)
+            stats = {
+                "models_initialized": {
+                    "embedding_model": self._embed_model is not None,
+                    "llm": self._llm is not None,
+                    "vector_store": self._vector_store is not None,
+                    "index": self._index is not None,
+                },
+                "query_cache": {
+                    "size": cache_size,
+                    "ttl_seconds": self._cache_ttl_seconds,
+                    "hits": self._cache_hits,
+                    "misses": self._cache_misses,
+                },
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+            return stats
 
     def cleanup(self):
         """Clean up resources to free up memory."""
@@ -225,6 +288,14 @@ class QueryEngineFactory:
             self._llm = None
             self._vector_store = None
             self._index = None
+            # Remove expired cache entries and trim cache
+            now = time.time()
+            keys_to_delete = [k for k, (ts, _) in self._query_cache.items() if now - ts > self._cache_ttl_seconds]
+            for k in keys_to_delete:
+                self._query_cache.pop(k, None)
+            # Optionally, clear entire cache if it grows too much
+            if len(self._query_cache) > 1000:
+                self._query_cache.clear()
             self.logger.info("Query engine factory resources have been cleaned up.")
 
 # ---------------------------------------------------------------------------
