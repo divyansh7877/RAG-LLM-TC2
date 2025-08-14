@@ -124,3 +124,9 @@ pdfs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Logs and runtime artifacts
+logs/
+logs/**/*
+celerybeat-schedule.*
+flower.*
