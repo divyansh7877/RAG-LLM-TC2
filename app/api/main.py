@@ -1128,15 +1128,16 @@ async def submit_query(
             }
         )
         
-        # Queue query task
+        # Queue query task with correct task name and arguments
         task = celery_app.send_task(
-            "process_query",
-            args=[
-                job.job_id,
-                current_user.user_id,
-                query_text
-            ],
-            queue="query"
+            "process_user_query",
+            kwargs={
+                "query_id": job.job_id,
+                "user_id": current_user.user_id,
+                "group_ids": current_user.groups,
+                "query_text": query_text.strip(),
+            },
+            queue="query",
         )
         
         # Update job with task ID
