@@ -369,7 +369,10 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         
         # Create query engine using the thread-safe factory
         update_query_progress(query_id, 0.3, "Initializing query engine...")
-        query_engine = query_engine_factory.create_query_engine(user_id, group_ids)
+        query_engine = query_engine_factory.create_query_engine(
+            user_id=user_id,
+            group_ids=group_ids,
+        )
         
         # Process query
         update_query_progress(query_id, 0.6, "Processing query...")
