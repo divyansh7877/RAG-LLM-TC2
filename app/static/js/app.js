@@ -472,7 +472,7 @@ class RAGApp {
 
         const personalOption = document.createElement('option');
         // Use canonical group id for personal scope
-        personalOption.value = 'personal';
+        personalOption.value = this.user.user_id;
         personalOption.textContent = 'Personal';
 
         if (groupSelect) {

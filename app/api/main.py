@@ -963,24 +963,34 @@ async def list_documents(
         dict: List of documents with metadata
     """
     try:
-        # Validate group access if specified
-        if group_id and group_id not in current_user.groups:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"User does not have access to group: {group_id}"
-            )
+        logger.info(f"list_documents called with group_id={group_id}, status={status}")
+        # Handle personal group
+        if group_id == "personal":
+            groups_to_search = [current_user.user_id]
+        elif group_id:
+            if group_id not in current_user.groups:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"User does not have access to group: {group_id}"
+                )
+            groups_to_search = [group_id]
+        else:
+            groups_to_search = current_user.groups
+
+        logger.info(f"Searching for documents in groups: {groups_to_search}")
         
         # Get documents from Redis
         documents = []
         
         # Search for user's documents across all groups or specific group
-        groups_to_search = [group_id] if group_id else current_user.groups
         
         for group in groups_to_search:
             pattern = f"document:{current_user.user_id}:{group}:*"
             with redis_client.get_connection() as client:
                 keys = client.keys(pattern)
             
+            logger.info(f"Found {len(keys)} keys in Redis for pattern: {pattern}")
+
             for key in keys:
                 try:
                     doc_data = redis_client.get_json(key.decode('utf-8'))
@@ -997,6 +1007,8 @@ async def list_documents(
                     logger.warning(f"Failed to parse document data from key {key}: {e}")
                     continue
         
+        logger.info(f"Found {len(documents)} documents in total for user {current_user.user_id}")
+
         # Sort by upload date (newest first)
         documents.sort(key=lambda x: x.get('upload_date', 0), reverse=True)
         
@@ -1004,6 +1016,8 @@ async def list_documents(
         total_count = len(documents)
         paginated_documents = documents[offset:offset + limit]
         
+        logger.info(f"Returning {len(paginated_documents)} documents to the frontend")
+
         return {
             "documents": paginated_documents,
             "total_count": total_count,
@@ -1022,182 +1036,14 @@ async def list_documents(
         )
 
 
-@app.delete("/api/documents/{document_id}", tags=["Documents"])
-async def delete_document(
-    document_id: str,
-    current_user: UserSession = Depends(get_current_user),
-    rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
-):
-    """
-    Delete a document and its associated data.
-    
-    Args:
-        document_id: Document identifier
-        current_user: Current authenticated user
-        rate_limit: Rate limiting dependency
-    
-    Returns:
-        dict: Deletion confirmation
-    
-    Raises:
-        HTTPException: If document not found or deletion fails
-    """
-    try:
-        # Validate permissions
-        if not current_user.has_permission("delete"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have delete permission"
-            )
-        
-        # Find and validate document ownership
-        document = None
-        doc_key = None
-        for group_id in current_user.groups:
-            potential_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
-            doc_data = redis_client.get_json(potential_key)
-            if doc_data:
-                document = Document.from_dict(doc_data)
-                doc_key = potential_key
-                break
-        
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # TODO: Delete associated vector embeddings from LanceDB
-        # This would require implementing a cleanup function in the embedding worker
-        # For now, we'll just delete the metadata
-        
-        # Delete document metadata from Redis
-        if not redis_client.delete(doc_key):
-            logger.warning(f"Failed to delete document metadata for {document_id}")
-        
-        logger.info(f"Deleted document {document_id} for user {current_user.user_id}")
-        
-        return {
-            "message": "Document deleted successfully",
-            "document_id": document_id,
-            "filename": document.filename,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting document {document_id} for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document deletion service error"
-        )
+
 
 
 # Query endpoints
-@app.post("/api/query", tags=["Query"])
-async def submit_query(
-    query_data: dict,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Submit a query for processing.
-    
-    Args:
-        query_data: Query data containing query_text
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Query submission result
-    """
-    try:
-        query_text = query_data.get("query_text", "")
-        if not query_text:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Query text is required"
-            )
-        
-        # Create query job
-        job = job_manager.create_job(
-            user_id=current_user.user_id,
-            job_type=JobType.QUERY,
-            metadata={
-                "query_text": query_text,
-                "user_id": current_user.user_id
-            }
-        )
-        
-        # Queue query task with correct task name and arguments
-        task = celery_app.send_task(
-            "process_user_query",
-            kwargs={
-                "query_id": job.job_id,
-                "user_id": current_user.user_id,
-                "group_ids": current_user.groups,
-                "query_text": query_text.strip(),
-            },
-            queue="query",
-        )
-        
-        # Update job with task ID
-        job.metadata["celery_task_id"] = task.id
-        redis_client.set_job(job)
-        
-        logger.info(f"Created query job {job.job_id} for user {current_user.user_id}")
-        
-        return {
-            "job_id": job.job_id,
-            "status": "queued",
-            "message": "Query submitted for processing",
-            "user_id": current_user.user_id
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Query submit error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Query service error"
-        )
 
 
-@app.get("/api/query/{query_id}", tags=["Query"])
-async def get_query_result(
-    query_id: str,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Get query result.
-    
-    Args:
-        query_id: ID of the query
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Query result
-    """
-    try:
-        job = job_manager.get_job(query_id)
 
-        if not job or job.user_id != current_user.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Query not found"
-            )
 
-        return {
-            "query_id": query_id,
-            "status": job.status.value,
-            "result": job.result,
-            "user_id": current_user.user_id
-        }
-    except Exception as e:
-        logger.error(f"Query result error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Query result service error"
-        )
 
 
 
@@ -1371,8 +1217,12 @@ async def upload_documents(
                 detail="User does not have upload permission"
             )
         
+        # Handle personal group
+        if group_id == "personal":
+            group_id = current_user.user_id
+
         # Validate group access
-        if group_id not in current_user.groups:
+        if group_id not in current_user.groups and group_id != current_user.user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"User does not have access to group: {group_id}"
@@ -1497,89 +1347,6 @@ async def upload_documents(
         )
 
 
-@app.get("/api/documents", tags=["Documents"])
-async def list_documents(
-    request: Request,
-    group_id: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    List user's documents with filtering and pagination.
-    
-    Args:
-        request: FastAPI request object
-        group_id: Optional group filter
-        status: Optional status filter
-        limit: Maximum number of documents to return
-        offset: Number of documents to skip
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: List of documents with metadata
-    """
-    try:
-        # Validate group access if specified
-        if group_id and group_id not in current_user.groups:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"User does not have access to group: {group_id}"
-            )
-        
-        # Get documents from Redis
-        documents = []
-        
-        # Search for user's documents across all groups or specific group
-        groups_to_search = [group_id] if group_id else current_user.groups
-        
-        for group in groups_to_search:
-            pattern = f"document:{current_user.user_id}:{group}:*"
-            with redis_client.get_connection() as client:
-                keys = client.keys(pattern)
-            
-            for key in keys:
-                try:
-                    doc_data = redis_client.get_json(key.decode('utf-8'))
-                    if doc_data:
-                        # Apply status filter if specified
-                        if status and doc_data.get('processing_status') != status:
-                            continue
-                        
-                        # Convert to Document model for validation
-                        document = Document.from_dict(doc_data)
-                        documents.append(document.to_dict())
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to parse document data from key {key}: {e}")
-                    continue
-        
-        # Sort by upload date (newest first)
-        documents.sort(key=lambda x: x.get('upload_date', 0), reverse=True)
-        
-        # Apply pagination
-        total_count = len(documents)
-        paginated_documents = documents[offset:offset + limit]
-        
-        return {
-            "documents": paginated_documents,
-            "total_count": total_count,
-            "limit": limit,
-            "offset": offset,
-            "has_more": offset + limit < total_count
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing documents for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document listing service error"
-        )
-
-
 @app.get("/api/documents/{document_id}", tags=["Documents"])
 async def get_document(
     document_id: str,
@@ -1626,76 +1393,7 @@ async def get_document(
         )
 
 
-@app.delete("/api/documents/{document_id}", tags=["Documents"])
-async def delete_document(
-    document_id: str,
-    current_user: UserSession = Depends(get_current_user),
-    rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
-):
-    """
-    Delete a document and its associated data.
-    
-    Args:
-        document_id: Document identifier
-        current_user: Current authenticated user
-        rate_limit: Rate limiting dependency
-    
-    Returns:
-        dict: Deletion confirmation
-    
-    Raises:
-        HTTPException: If document not found or deletion fails
-    """
-    try:
-        # Validate permissions
-        if not current_user.has_permission("delete"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have delete permission"
-            )
-        
-        # Find and validate document ownership
-        document = None
-        doc_key = None
-        for group_id in current_user.groups:
-            potential_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
-            doc_data = redis_client.get_json(potential_key)
-            if doc_data:
-                document = Document.from_dict(doc_data)
-                doc_key = potential_key
-                break
-        
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # TODO: Delete associated vector embeddings from LanceDB
-        # This would require implementing a cleanup function in the embedding worker
-        # For now, we'll just delete the metadata
-        
-        # Delete document metadata from Redis
-        if not redis_client.delete(doc_key):
-            logger.warning(f"Failed to delete document metadata for {document_id}")
-        
-        logger.info(f"Deleted document {document_id} for user {current_user.user_id}")
-        
-        return {
-            "message": "Document deleted successfully",
-            "document_id": document_id,
-            "filename": document.filename,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting document {document_id} for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document deletion service error"
-        )
+
 
 
 @app.get("/api/documents/{document_id}/status", tags=["Documents"])
@@ -1755,6 +1453,7 @@ async def get_document_status(
 
 # Job management endpoints
 from ..shared.job_manager import job_manager, JobType, JobStatus
+
 
 @app.get("/api/jobs", tags=["Jobs"])
 async def list_jobs(
@@ -1992,97 +1691,7 @@ async def cancel_job(
             detail="Job cancellation service error"
         )
 
-@app.get("/api/jobs", tags=["Jobs"])
-async def list_jobs(
-    request: Request,
-    job_type: Optional[str] = None,
-    status: Optional[str] = None,
-    active_only: bool = False,
-    limit: int = 50,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    List user's jobs with filtering.
-    
-    Args:
-        request: FastAPI request object
-        job_type: Optional job type filter (embedding, query)
-        status: Optional status filter
-        active_only: If True, only return non-finished jobs
-        limit: Maximum number of jobs to return
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: List of jobs with metadata
-    """
-    try:
-        # Parse job type filter
-        job_type_filter = None
-        if job_type:
-            try:
-                job_type_filter = JobType(job_type.lower())
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid job type: {job_type}. Valid types: {[t.value for t in JobType]}"
-                )
-        
-        # Parse status filter
-        status_filter = None
-        if status:
-            try:
-                status_filter = JobStatus(status.lower())
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status}. Valid statuses: {[s.value for s in JobStatus]}"
-                )
-        
-        # Get user jobs
-        jobs = job_manager.get_user_jobs(
-            user_id=current_user.user_id,
-            job_type=job_type_filter,
-            status=status_filter,
-            active_only=active_only,
-            limit=limit
-        )
-        
-        # Convert to dict format
-        job_list = []
-        for job in jobs:
-            job_dict = job.to_dict()
-            # Add estimated completion time for processing jobs
-            if job.status == JobStatus.PROCESSING and job.progress > 0:
-                try:
-                    elapsed = (datetime.now() - job.started_at).total_seconds()
-                    estimated_total = elapsed / job.progress
-                    remaining = estimated_total - elapsed
-                    if remaining > 0:
-                        completion_time = datetime.now().timestamp() + remaining
-                        job_dict["estimated_completion"] = datetime.fromtimestamp(completion_time).isoformat()
-                except Exception:
-                    pass  # Skip if calculation fails
-            
-            job_list.append(job_dict)
-        
-        return {
-            "jobs": job_list,
-            "total_count": len(job_list),
-            "filters": {
-                "job_type": job_type,
-                "status": status,
-                "active_only": active_only
-            }
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing jobs for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Job listing service error"
-        )
+
 
 
 @app.get("/api/jobs/{job_id}", tags=["Jobs"])
@@ -2403,9 +2012,6 @@ async def get_websocket_stats(
     
     Args:
         current_user: Current authenticated user (must have admin permission)
-    
-    Returns:
-        dict: WebSocket connection statistics
     """
     try:
         stats = websocket_manager.get_connection_stats()
@@ -2455,134 +2061,6 @@ async def websocket_health_check():
                 },
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }
-        )
-    """
-    Get document processing status and progress.
-    
-    Args:
-        document_id: Document identifier
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Document status and processing information
-    """
-    try:
-        # Find document
-        document = None
-        for group_id in current_user.groups:
-            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
-            doc_data = redis_client.get_json(doc_key)
-            if doc_data:
-                document = Document.from_dict(doc_data)
-                break
-        
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # Get associated job information if available
-        job_info = None
-        
-        # Search for embedding jobs related to this document
-        user_jobs = job_manager.get_user_jobs(current_user.user_id, job_type=JobType.EMBEDDING)
-        for job in user_jobs:
-            if (job.metadata.get("group_id") == document.group_id and 
-                document.filename in job.metadata.get("filenames", [])):
-                job_info = {
-                    "job_id": job.job_id,
-                    "status": job.status.value,
-                    "progress": job.progress,
-                    "created_at": job.created_at.isoformat() + "Z",
-                    "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
-                    "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
-                    "error": job.error
-                }
-                break
-        
-        return {
-            "document_id": document.document_id,
-            "filename": document.filename,
-            "processing_status": document.processing_status,
-            "page_count": document.page_count,
-            "chunk_count": document.chunk_count,
-            "upload_date": document.upload_date.isoformat() + "Z" if hasattr(document.upload_date, 'isoformat') else document.upload_date,
-            "file_size": document.file_size,
-            "job_info": job_info
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document status service error"
-        )
-    """
-    Get document processing status and progress.
-    
-    Args:
-        document_id: Document identifier
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Document status and processing information
-    """
-    try:
-        # Find document
-        document = None
-        for group_id in current_user.groups:
-            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
-            doc_data = redis_client.get_json(doc_key)
-            if doc_data:
-                document = Document.from_dict(doc_data)
-                break
-        
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # Get associated job information if available
-        job_info = None
-        
-        # Search for embedding jobs related to this document
-        user_jobs = job_manager.get_user_jobs(current_user.user_id, job_type=JobType.EMBEDDING)
-        for job in user_jobs:
-            if (job.metadata.get("group_id") == document.group_id and 
-                document.filename in job.metadata.get("filenames", [])):
-                job_info = {
-                    "job_id": job.job_id,
-                    "status": job.status.value,
-                    "progress": job.progress,
-                    "created_at": job.created_at.isoformat() + "Z",
-                    "started_at": job.started_at.isoformat() + "Z" if job.started_at else None,
-                    "completed_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
-                    "error": job.error
-                }
-                break
-        
-        return {
-            "document_id": document.document_id,
-            "filename": document.filename,
-            "processing_status": document.processing_status,
-            "page_count": document.page_count,
-            "chunk_count": document.chunk_count,
-            "upload_date": document.upload_date.isoformat() + "Z" if hasattr(document.upload_date, 'isoformat') else document.upload_date,
-            "file_size": document.file_size,
-            "job_info": job_info
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document status service error"
         )
 
 
@@ -3284,41 +2762,6 @@ async def get_query_cache_info(
 from fastapi import WebSocket, WebSocketDisconnect
 from ..shared.websocket_manager import websocket_manager
 
-@app.websocket("/ws/updates")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
-    """
-    WebSocket endpoint for real-time updates.
-    
-    Args:
-        websocket: WebSocket connection
-        token: Authentication token from query parameter
-    """
-    if not token:
-        await websocket.close(code=4001)
-        return
-    
-    try:
-        # Connect and authenticate
-        connection = await websocket_manager.connect(websocket, token)
-        
-        # Handle messages
-        while True:
-            try:
-                message = await websocket.receive_text()
-                await websocket_manager.handle_message(connection.connection_id, message)
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"WebSocket message error: {e}")
-                break
-    
-    except Exception as e:
-        logger.error(f"WebSocket connection error: {e}")
-    
-    finally:
-        # Clean up connection
-        if 'connection' in locals():
-            await websocket_manager.disconnect(connection.connection_id)
 
 
 if __name__ == "__main__":

@@ -71,7 +71,22 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
 
         if result.success:
             logger.info(f"Embedding job {job_id} completed successfully.")
+            job_manager.update_job_progress(job_id, 1.0)
             job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result.to_dict())
+
+            # Store metadata for each document
+            for file_path in file_paths:
+                try:
+                    store_document_metadata(
+                        user_id=user_id,
+                        group_id=group_id,
+                        file_path=file_path,
+                        page_count=0,  # Placeholder, as DocumentProcessor doesn't return this yet
+                        chunk_count=0  # Placeholder
+                    )
+                    logger.info(f"Stored metadata for {os.path.basename(file_path)}")
+                except Exception as e:
+                    logger.error(f"Failed to store metadata for {os.path.basename(file_path)}: {e}")
             # Cleanup temp upload dir
             try:
                 job = redis_client.get_job(job_id)
@@ -106,6 +121,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
             job_manager.update_job_progress(job_id, 0.05, f"Retrying after error: {str(e)}")
         else:
             # Final failure: mark failed and cleanup temp upload directory
+            job_manager.update_job_progress(job_id, 1.0)
             job_manager.update_job_status(job_id, JobStatus.FAILED, error=str(e))
             try:
                 job = redis_client.get_job(job_id)
