@@ -17,6 +17,8 @@ echo -e "${GREEN}Starting Celery workers for concurrent RAG system...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH}"
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
 # Verify celery is available
 if ! command -v celery >/dev/null 2>&1; then
@@ -46,7 +48,7 @@ start_worker() {
     
     # Use solo pool for embedding worker to avoid fork with fork-unsafe libs
     local pool_arg=""
-    if [ "${worker_name}" = "embedding_worker" ]; then
+    if [ "${worker_name}" = "embeddi_worker" ] || [ "${worker_name}" = "query_worker" ]; then
         pool_arg="--pool=solo"
     fi
 
@@ -59,7 +61,7 @@ start_worker() {
         ${pool_arg} \
         --loglevel=info \
         --logfile="${log_file}" \
-        > >(tee -a "${log_file}") 2>&1 &
+        >> "${log_file}" 2>&1 &
     echo $! > "${pid_file}"
     
     # Verify the worker actually started
@@ -90,7 +92,7 @@ echo -e "${YELLOW}Starting Celery Beat scheduler...${NC}"
 nohup celery -A app.workers.celery_app beat \
     --loglevel=info \
     --logfile=logs/workers/beat.log \
-    > >(tee -a logs/workers/beat.log) 2>&1 &
+    >> logs/workers/beat.log 2>&1 &
 echo $! > logs/workers/beat.pid
 
 if [ $? -eq 0 ]; then

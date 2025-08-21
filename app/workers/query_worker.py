@@ -5,6 +5,7 @@ import os
 import time
 import logging
 import hashlib
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from celery import current_task
 from celery.exceptions import Retry
@@ -83,7 +84,76 @@ def validate_query_security(user_id: str, group_ids: List[str], query_text: str)
         raise QuerySecurityError("Query text too long (max 2000 characters)")
 
 
-def extract_source_info(response) -> List[str]:
+def generate_cache_key(user_id: str, group_ids: List[str], query_text: str) -> str:
+    """
+    Generate a cache key for query results.
+    
+    Args:
+        user_id: User identifier
+        group_ids: List of group IDs
+        query_text: Query text
+        
+    Returns:
+        str: Cache key for the query
+    """
+    try:
+        # Normalize inputs for consistent caching
+        normalized_groups = ",".join(sorted(group_ids or []))
+        normalized_query = query_text.strip().lower()
+        
+        # Create cache key payload
+        payload = f"u:{user_id}|g:{normalized_groups}|q:{normalized_query}"
+        
+        # Generate hash
+        cache_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return f"query_cache:{cache_key}"
+        
+    except Exception as e:
+        logger.error(f"Failed to generate cache key: {e}")
+        # Return a fallback key that won't match anything
+        return f"query_cache:error_{time.time()}"
+
+
+def create_user_security_filters(user_id: str, group_ids: List[str]):
+    """
+    Create security filters for user isolation.
+    
+    Args:
+        user_id: User identifier
+        group_ids: List of group IDs the user has access to
+        
+    Returns:
+        MetadataFilters: Filters that ensure user can only access authorized documents
+        
+    Raises:
+        ValueError: If inputs are invalid
+    """
+    from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
+    
+    if not user_id or not user_id.strip():
+        raise ValueError("User ID is required")
+    
+    if not group_ids or len(group_ids) == 0:
+        raise ValueError("At least one group ID is required")
+    
+    try:
+        # Create user filter
+        user_filter = ExactMatchFilter(key="user_id", value=user_id)
+        
+        # Create group filters
+        group_filters = [ExactMatchFilter(key="group_id", value=group_id) for group_id in group_ids]
+        
+        # Combine filters: user can access their personal docs OR docs from their groups
+        all_filters = [user_filter] + group_filters
+        
+        return MetadataFilters(filters=all_filters, condition="or")
+        
+    except Exception as e:
+        logger.error(f"Failed to create user security filters: {e}")
+        raise ValueError(f"Failed to create security filters: {e}")
+
+
+def extract_source_info(response) -> List[Dict[str, Any]]:
     """
     Extract source document information from query response.
     
@@ -91,41 +161,66 @@ def extract_source_info(response) -> List[str]:
         response: Query engine response object
         
     Returns:
-        List of source document names
+        List of dictionaries containing source information
     """
     sources = []
     try:
         if hasattr(response, 'source_nodes') and response.source_nodes:
             for node in response.source_nodes:
-                if hasattr(node, 'metadata') and node.metadata:
-                    doc_name = node.metadata.get('document_name', 'Unknown Document')
-                    page_num = node.metadata.get('page_number', '')
-                    if page_num:
-                        source_info = f"{doc_name} (Page {page_num})"
-                    else:
-                        source_info = doc_name
+                if hasattr(node, 'node') and hasattr(node.node, 'metadata') and node.node.metadata:
+                    metadata = node.node.metadata
+                    doc_name = metadata.get('document_name', 'Unknown Document')
+                    page_num = metadata.get('page_number', '')
+                    
+                    source_info = {
+                        "document": doc_name,
+                        "page": page_num if page_num else "Unknown"
+                    }
+                    
+                    # Avoid duplicates
+                    if source_info not in sources:
+                        sources.append(source_info)
+                elif hasattr(node, 'metadata') and node.metadata:
+                    # Handle different node structure
+                    metadata = node.metadata
+                    doc_name = metadata.get('document_name', 'Unknown Document')
+                    page_num = metadata.get('page_number', '')
+                    
+                    source_info = {
+                        "document": doc_name,
+                        "page": page_num if page_num else "Unknown"
+                    }
                     
                     if source_info not in sources:
                         sources.append(source_info)
                 else:
                     # Handle nodes with missing or empty metadata
-                    sources.append("Unknown Document")
+                    sources.append({
+                        "document": "Unknown Document",
+                        "page": "Unknown"
+                    })
         
         return sources[:5]  # Limit to top 5 sources
         
     except Exception as e:
         logger.warning(f"Failed to extract source info: {e}")
-        return ["Source information unavailable"]
+        return [{"document": "Source information unavailable", "page": "Unknown"}]
 
 
 def update_query_progress(query_id: str, progress: float, status_message: str = None):
     """Update query progress using job manager and trigger WebSocket notifications."""
     try:
-        # Update job progress through job manager (this will trigger WebSocket notifications)
-        success = job_manager.update_job_progress(query_id, progress, status_message)
-        
-        if not success:
-            logger.warning(f"Failed to update query progress for {query_id}")
+        # Get the job_id from the query data
+        query_data = redis_client.get_json(f"query:{query_id}")
+        if query_data and "job_id" in query_data:
+            job_id = query_data["job_id"]
+            # Update job progress through job manager (this will trigger WebSocket notifications)
+            success = job_manager.update_job_progress(job_id, progress, status_message)
+            
+            if not success:
+                logger.warning(f"Failed to update query progress for query {query_id}, job {job_id}")
+        else:
+            logger.warning(f"No job_id found for query {query_id}")
         
         # Update Celery task state for Celery monitoring
         if current_task:
@@ -340,10 +435,18 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         # Validate inputs and security
         validate_query_security(user_id, group_ids, query_text)
         
-        # Update job status to processing (this will trigger WebSocket notification)
-        job_manager.update_job_status(query_id, JobStatus.PROCESSING)
+        # Get the job_id from the query data
+        query_data = redis_client.get_json(f"query:{query_id}")
+        job_id = query_data.get("job_id") if query_data else None
         
-        logger.info(f"Starting query {query_id} for user {user_id} with groups {group_ids}")
+        if not job_id:
+            logger.error(f"No job_id found for query {query_id}")
+            raise ValueError(f"No job_id found for query {query_id}")
+        
+        # Update job status to processing (this will trigger WebSocket notification)
+        job_manager.update_job_status(job_id, JobStatus.PROCESSING)
+        
+        logger.info(f"Starting query {query_id} (job {job_id}) for user {user_id} with groups {group_ids}")
         
         # Check cache first using the new factory cache
         update_query_progress(query_id, 0.1, "Checking cache...")
@@ -362,7 +465,16 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             )
             
             # Update job status to completed (this will trigger WebSocket notification)
-            job_manager.update_job_status(query_id, JobStatus.COMPLETED, result=cached_result)
+            job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=cached_result)
+            
+            # Update query record with cached result
+            query_data = redis_client.get_json(f"query:{query_id}")
+            if query_data:
+                query_data["status"] = "completed"
+                query_data["result"] = cached_result
+                query_data["completed_at"] = datetime.now().isoformat()
+                query_data["processing_time"] = processing_time
+                redis_client.set_json(f"query:{query_id}", query_data, expire_seconds=3600)
             
             logger.info(f"Query {query_id} completed from cache in {processing_time:.2f}s")
             return cached_result
@@ -408,7 +520,16 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         )
         
         # Update job status to completed (this will trigger WebSocket notification)
-        job_manager.update_job_status(query_id, JobStatus.COMPLETED, result=result)
+        job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
+        
+        # Update query record with result
+        query_data = redis_client.get_json(f"query:{query_id}")
+        if query_data:
+            query_data["status"] = "completed"
+            query_data["result"] = result
+            query_data["completed_at"] = datetime.now().isoformat()
+            query_data["processing_time"] = processing_time
+            redis_client.set_json(f"query:{query_id}", query_data, expire_seconds=3600)
         
         logger.info(f"Query {query_id} completed successfully in {processing_time:.2f}s with {len(sources)} sources")
         return result
@@ -417,8 +538,21 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         logger.error(f"Security violation in query {query_id}: {e}")
         error_message = f"Security validation failed: {e}"
         
-        # Update job status to failed (this will trigger WebSocket notification)
-        job_manager.update_job_status(query_id, JobStatus.FAILED, error=error_message)
+        # Get job_id for error handling
+        query_data = redis_client.get_json(f"query:{query_id}")
+        job_id = query_data.get("job_id") if query_data else None
+        
+        if job_id:
+            # Update job status to failed (this will trigger WebSocket notification)
+            job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_message)
+        
+        # Update query record with error
+        if query_data:
+            query_data["status"] = "failed"
+            query_data["error"] = error_message
+            query_data["error_type"] = "security_error"
+            query_data["completed_at"] = datetime.now().isoformat()
+            redis_client.set_json(f"query:{query_id}", query_data, expire_seconds=3600)
         
         # Don't retry security errors
         raise ValueError(error_message)
@@ -438,8 +572,21 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             query_id, user_id, query_text, processing_time, 0, False, error_message
         )
         
-        # Update job status to failed (this will trigger WebSocket notification)
-        job_manager.update_job_status(query_id, JobStatus.FAILED, error=error_message)
+        # Get job_id for error handling
+        query_data = redis_client.get_json(f"query:{query_id}")
+        job_id = query_data.get("job_id") if query_data else None
+        
+        if job_id:
+            # Update job status to failed (this will trigger WebSocket notification)
+            job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_message)
+        
+        # Update query record with error
+        if query_data:
+            query_data["status"] = "failed"
+            query_data["error"] = error_message
+            query_data["error_type"] = "processing_error"
+            query_data["completed_at"] = datetime.now().isoformat()
+            redis_client.set_json(f"query:{query_id}", query_data, expire_seconds=3600)
         
         # Re-raise for Celery error handling
         raise

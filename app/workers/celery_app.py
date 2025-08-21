@@ -1,6 +1,20 @@
 """
 Celery application configuration for background task processing.
 """
+import multiprocessing
+
+# Set the start method to 'spawn' for fork-safety BEFORE any other imports
+# that might initialize multiprocessing. This is crucial for libraries like
+# PyTorch (CUDA) and LanceDB that are not fork-safe.
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    # This will fail if the start method has already been set.
+    # We can safely ignore this if it's already set to 'spawn'.
+    if multiprocessing.get_start_method() != "spawn":
+        # Re-raise the error if it's already been set to something else.
+        raise
+
 from celery import Celery
 from celery.signals import worker_ready, worker_shutdown, task_prerun, task_postrun
 from ..shared.config import config
@@ -9,21 +23,10 @@ import logging
 import os
 import psutil
 import time
-import multiprocessing
 
 # Configure logging as early as possible
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Set the start method to 'spawn' for fork-safety
-# This is crucial for libraries like LanceDB that are not fork-safe.
-try:
-    multiprocessing.set_start_method("spawn", force=True)
-except RuntimeError:
-    # This will fail if the start method has already been set.
-    # We can safely ignore this if it's already set to 'spawn'.
-    if multiprocessing.get_start_method() != "spawn":
-        logger.warning("Could not set multiprocessing start method to 'spawn'.")
 
 # Create Celery app
 celery_app = Celery(
@@ -44,6 +47,14 @@ celery_app.conf.update(
         "app.workers.embedding_worker.*": {"queue": "embedding", "routing_key": "embedding"},
         "app.workers.query_worker.*": {"queue": "query", "routing_key": "query"},
         "app.workers.maintenance_worker.*": {"queue": "maintenance", "routing_key": "maintenance"},
+        # Explicit task name routing for tasks with custom names
+        "process_user_query": {"queue": "query", "routing_key": "query"},
+        "process_document_embedding": {"queue": "embedding", "routing_key": "embedding"},
+        "get_query_status": {"queue": "query", "routing_key": "query"},
+        "cleanup_query_cache": {"queue": "maintenance", "routing_key": "maintenance"},
+        "cleanup_expired_sessions": {"queue": "maintenance", "routing_key": "maintenance"},
+        "system_health_check": {"queue": "maintenance", "routing_key": "maintenance"},
+        "worker_health_report": {"queue": "maintenance", "routing_key": "maintenance"},
     },
     
     # Worker configuration for resource management

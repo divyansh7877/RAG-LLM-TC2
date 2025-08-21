@@ -77,6 +77,14 @@ class AuthenticationManager:
         
         In production, this should query a proper user database.
         """
+        if username == "guest":
+            return {
+                "username": "guest",
+                "password_hash": self._hash_password("guest"),
+                "groups": ["personal"],
+                "permissions": ["query", "upload"]
+            }
+
         user_data = config.USERS.get(username)
         if user_data:
             return {

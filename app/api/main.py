@@ -2296,10 +2296,10 @@ async def submit_query(
         
         # Queue query processing task
         task = process_user_query.delay(
-            query_id=query.query_id,
-            user_id=current_user.user_id,
-            group_ids=current_user.groups,
-            query_text=query_data.query_text.strip()
+            query.query_id,
+            current_user.user_id,
+            current_user.groups,
+            query_data.query_text.strip()
         )
         
         # Update job with task ID

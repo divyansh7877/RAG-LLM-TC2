@@ -1,0 +1,51 @@
+INFO:app.shared.job_manager:JobManager initialized
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_name" in ColPaliEmbeddings has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_path" in LayoutModelConfig has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_spec" in LayoutOptions has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+INFO:datasets:PyTorch version 2.3.1.post100 available.
+INFO:app.shared.session_manager:SessionManager initialized with Redis backend
+WARNING:app.shared.auth:Using default secret key - change in production!
+INFO:app.shared.auth:AuthenticationManager initialized
+INFO:app.shared.websocket_manager:WebSocketManager initialized
+INFO:app.shared.job_notifications:JobNotificationService initialized
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_url" in LlamaCPP has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_path" in LlamaCPP has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+/home/divyansh/miniconda3/envs/llm/lib/python3.11/site-packages/pydantic/_internal/_fields.py:132: UserWarning: Field "model_kwargs" in LlamaCPP has conflict with protected namespace "model_".
+
+You may be able to resolve this warning by setting `model_config['protected_namespaces'] = ()`.
+  warnings.warn(
+ 
+ -------------- embedding_worker@div-hp v5.5.3 (immunity)
+--- ***** ----- 
+-- ******* ---- Linux-6.14.0-28-generic-x86_64-with-glibc2.41 2025-08-19 18:35:56
+- *** --- * --- 
+- ** ---------- [config]
+- ** ---------- .> app:         rag_workers:0x7cb7b85c9f90
+- ** ---------- .> transport:   redis://localhost:6379/0
+- ** ---------- .> results:     redis://localhost:6379/0
+- *** --- * --- .> concurrency: 1 (solo)
+-- ******* ---- .> task events: ON
+--- ***** ----- 
+ -------------- [queues]
+                .> embedding        exchange=embedding(direct) key=embedding
+                .> embedding_worker@div-hp.dq2 exchange=C.dq2(direct) key=embedding_worker@div-hp
+
+
+worker: Hitting Ctrl+C again will initiate cold shutdown, terminating all running tasks!
+
+worker: Warm shutdown (MainProcess)

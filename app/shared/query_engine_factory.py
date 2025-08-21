@@ -38,7 +38,7 @@ from .error_handling import StructuredLogger
 DB_PATH = "./multi_user_db.lance"
 TABLE_NAME = "document_embeddings"
 EMBED_MODEL_NAME = "./models/gte-large-en-v1.5"  # INT8‐quantised, CPU
-GGUF_MODEL_PATH = "./models/Llama-3.2-3B-Instruct-IQ3_M.gguf"  # llama.cpp model
+GGUF_MODEL_PATH = "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"  # llama.cpp model
 
 has_cuda = torch.cuda.is_available()
 
@@ -49,8 +49,10 @@ FINAL_K = 8     # chunks passed to the LLM
 MMR_LAMBDA = 0.1
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 N_THREADS = mp.cpu_count()
-N_GPU_LAYERS = -1 if has_cuda else 0 # set 0 if no GPU / VRAM < 12 GB
-N_BATCH = 1024 if has_cuda else 64   # llama.cpp prompt batch size
+# Optimize for limited GPU memory (3.6 GB)
+# Use partial GPU layers to fit within memory constraints
+N_GPU_LAYERS = -1 if has_cuda else 0  # Use 20 layers on GPU, rest on CPU
+N_BATCH = 128 if has_cuda else 64     # Smaller batch size for limited VRAM
 
 # ---------------------------------------------------------------------------
 # Prompt enforcing source citations
@@ -93,12 +95,17 @@ class QueryEngineFactory:
         if self._embed_model is None:
             with self._lock:
                 if self._embed_model is None:
+                    # Use GPU for embedding model if available.
+                    # Note: This may require setting the Celery worker start method to 'spawn' or 'forkserver'
+                    # to avoid CUDA multiprocessing issues.
+                    embed_device = device
+                    
                     self._embed_model = HuggingFaceEmbedding(
                         model_name=EMBED_MODEL_NAME,
-                        device=device,
+                        device=embed_device,
                         trust_remote_code=True,
-                        model_kwargs={"quantize": "static-int8"},
                     )
+                    self.logger.info(f"Initialized embedding model on device: {embed_device}")
         return self._embed_model
     
     def _get_llm(self):
@@ -106,11 +113,14 @@ class QueryEngineFactory:
         if self._llm is None:
             with self._lock:
                 if self._llm is None:
+                    self.logger.info(f"LLM Factory: CUDA available: {has_cuda}, using {N_GPU_LAYERS} GPU layers.")
+                    if not has_cuda:
+                        self.logger.warning("LLM Factory: CUDA not available. LLM will run on CPU. Check PyTorch/CUDA installation and NVIDIA drivers.")
                     self._llm = LlamaCPP(
                         model_path=GGUF_MODEL_PATH,
                         temperature=0.3,
                         max_new_tokens=512,
-                        context_window=2048,
+                        context_window=1024,
                         model_kwargs={
                             "n_batch": N_BATCH,
                             "n_gpu_layers": N_GPU_LAYERS,
@@ -147,6 +157,42 @@ class QueryEngineFactory:
                     )
         return self._index
     
+    def _create_user_security_filters(self, user_id: str, group_ids: List[str]):
+        """
+        Create security filters for user isolation.
+        
+        Args:
+            user_id: User identifier
+            group_ids: List of group IDs the user has access to
+            
+        Returns:
+            MetadataFilters: Filters that ensure user can only access authorized documents
+            
+        Raises:
+            ValueError: If inputs are invalid
+        """
+        if not user_id or not user_id.strip():
+            raise ValueError("User ID is required")
+        
+        if not group_ids or len(group_ids) == 0:
+            raise ValueError("At least one group ID is required")
+        
+        try:
+            # Create user filter
+            user_filter = ExactMatchFilter(key="user_id", value=user_id)
+            
+            # Create group filters
+            group_filters = [ExactMatchFilter(key="group_id", value=group_id) for group_id in group_ids]
+            
+            # Combine filters: user can access their personal docs OR docs from their groups
+            all_filters = [user_filter] + group_filters
+            
+            return MetadataFilters(filters=all_filters, condition="or")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create user security filters: {e}")
+            raise ValueError(f"Failed to create security filters: {e}")
+
     def create_query_engine(
         self,
         user_filters: Optional[MetadataFilters] = None,
@@ -172,10 +218,7 @@ class QueryEngineFactory:
         # Build filters if user_id/group_ids provided
         if user_filters is None and user_id is not None:
             try:
-                user_filter = ExactMatchFilter(key="user_id", value=user_id)
-                group_filters = [ExactMatchFilter(key="group_id", value=gid) for gid in (group_ids or [])]
-                all_filters = [user_filter] + group_filters
-                user_filters = MetadataFilters(filters=all_filters, condition="or")
+                user_filters = self._create_user_security_filters(user_id, group_ids or [])
             except Exception as e:
                 self.logger.error(f"Failed to build user filters: {e}")
 
@@ -183,11 +226,11 @@ class QueryEngineFactory:
         if user_filters is not None:
             retriever.vector_store_kwargs = {"filters": user_filters}
         
-        # Create reranker
+        # Create reranker - use GPU if available
         reranker = SentenceTransformerRerank(
             model="cross-encoder/ms-marco-MiniLM-L-6-v2", 
             top_n=FINAL_K,
-            device=device, 
+            device=device,
         )
         
         # Create response synthesizer
