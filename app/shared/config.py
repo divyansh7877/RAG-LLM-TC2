@@ -36,7 +36,7 @@ class Config:
         "max_concurrent_queries": int(os.getenv("MAX_CONCURRENT_QUERIES", "10")),
         "max_memory_per_worker": os.getenv("MAX_MEMORY_PER_WORKER", "8GB"),
         "max_queue_size": int(os.getenv("MAX_QUEUE_SIZE", "100")),
-        "worker_timeout": int(os.getenv("WORKER_TIMEOUT", "600"))
+        "worker_timeout": int(os.getenv("WORKER_TIMEOUT", "6000"))
     }
     
     # Rate limiting
@@ -68,6 +68,7 @@ class Config:
     USERS = {
         "assistant1": {"password": "password1", "groups": ["personal","assistance", "common_rules"]},
         "assistant2": {"password": "password2", "groups": ["personal","assistance"]},
+        "div": {"password": "1234", "groups": ["personal","assistance","mine"]},
         "guest": {"password": "password", "groups": ["personal","common_rules"]},
     }
 

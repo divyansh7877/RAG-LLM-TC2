@@ -343,7 +343,7 @@ def _update_aggregated_metrics(metrics: Dict[str, Any]):
         hourly_stats["total_processing_time"] += metrics["processing_time"]
         hourly_stats["avg_processing_time"] = hourly_stats["total_processing_time"] / hourly_stats["total_queries"]
         
-        redis_client.set_json(hour_key, hourly_stats, expire_seconds=86400 * 7)  # Keep for 7 days
+        redis_client.set_json(hour_key, hourly_stats, expire_seconds=86400 * 1)  # Keep for 7 days
         
     except Exception as e:
         logger.error(f"Failed to update aggregated metrics: {e}")
