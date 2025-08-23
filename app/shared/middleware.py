@@ -63,12 +63,24 @@ def require_roles(required_roles: List[str]):
     Create a dependency that requires specific roles from the Keycloak token.
     """
     async def role_checker(current_user: User = Depends(get_current_user)) -> User:
-        user_roles = set(current_user.roles)
+        user_roles = set(current_user.roles or [])
         required = set(required_roles)
         if not required.issubset(user_roles):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Insufficient permissions. Required roles: {', '.join(required)}"
+            )
+        return current_user
+    return role_checker
+
+def require_any_role(allowed_roles: List[str]):
+    """Create a dependency that requires any one of the given roles."""
+    async def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        user_roles = set(current_user.roles or [])
+        if not set(allowed_roles).intersection(user_roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions. One of required roles: {', '.join(allowed_roles)}"
             )
         return current_user
     return role_checker

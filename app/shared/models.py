@@ -45,14 +45,14 @@ class User(BaseModel):
     def has_permission(self, permission: str) -> bool:
         """Basic permission check mapped to Keycloak roles.
 
-        - "query" requires role "assistance" or "admin".
+        - "query" requires role "query", "standard", or "admin".
         - Fallback: admin has all permissions.
         """
         role_set = set(self.roles or [])
         if 'admin' in role_set:
             return True
         if permission == 'query':
-            return 'assistance' in role_set
+            return bool({'query', 'standard'} & role_set)
         return False
 
 class JobStatus(str, Enum):

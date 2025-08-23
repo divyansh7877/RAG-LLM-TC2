@@ -20,7 +20,7 @@ import uvicorn
 
 from ..shared.config import config
 from ..shared.redis_client import redis_client
-from ..shared.middleware import rate_limiter, get_current_user, require_roles
+from ..shared.middleware import rate_limiter, get_current_user, require_roles, require_any_role
 from ..shared.error_handling import error_handler, set_log_context, clear_log_context, StructuredLogger
 from ..shared.monitoring import metric_collector, alert_manager, health_checker, start_monitoring_thread
 from ..shared.models import Document, User
@@ -888,7 +888,8 @@ async def upload_documents(
     request: Request,
     files: List[UploadFile] = File(...),
     group_id: str = Form(...),
-    current_user: User = Depends(require_roles(["assistance"])),
+    # Accept users with upload, standard, or admin role
+    current_user: User = Depends(require_any_role(["upload", "standard", "admin"])),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 uploads per 5 minutes
 ):
     """
