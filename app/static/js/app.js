@@ -1,12 +1,11 @@
 /**
- * Concurrent RAG System Frontend Application
+ * Concurrent RAG System Frontend Application with Keycloak Integration
  */
 
 class RAGApp {
     constructor() {
         this.apiBase = '/api';
-        this.wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/updates`;
-        this.token = localStorage.getItem('auth_token');
+        this.keycloak = null;
         this.user = null;
         this.websocket = null;
         this.reconnectAttempts = 0;
@@ -16,7 +15,6 @@ class RAGApp {
         this.jobsRefreshIntervalId = null;
         this.jobsAutoRefreshDelay = 5000;
 
-        // Supported file types and their MIME types
         this.supportedFileTypes = {
             'application/pdf': '.pdf',
             'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
@@ -33,41 +31,56 @@ class RAGApp {
 
     async init() {
         console.log('RAGApp initializing...');
-        console.log('Token:', this.token);
-
+        // Compute WebSocket URL based on current location
+        this.wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/updates';
+        this.setupKeycloak();
         this.setupEventListeners();
+    }
 
-        // Check if user is already logged in
-        if (this.token) {
-            console.log('Token found, validating session...');
-            try {
-                await this.validateSession();
+    setupKeycloak() {
+        this.keycloak = new Keycloak({
+            url: 'http://localhost:8080/',
+            realm: 'rag_app',
+            clientId: 'fastapi-client'
+        });
+
+        this.keycloak.init({ onLoad: 'check-sso' }).then(authenticated => {
+            if (authenticated) {
+                console.log('User is authenticated');
+                // Merge id token and access token claims for completeness
+                const idClaims = this.keycloak.idTokenParsed || {};
+                const accessClaims = this.keycloak.tokenParsed || {};
+                this.user = { ...idClaims, ...accessClaims };
                 this.showMainApp();
                 this.connectWebSocket();
-            } catch (error) {
-                console.error('Session validation failed:', error);
-                this.logout();
+            } else {
+                console.log('User is not authenticated');
+                this.showLogin();
             }
-        } else {
-            console.log('No token found, showing login...');
+        }).catch(error => {
+            console.error('Keycloak initialization failed:', error);
             this.showLogin();
-        }
+        });
+
+        this.keycloak.onTokenExpired = () => {
+            this.keycloak.updateToken(30).catch(() => {
+                console.error('Failed to refresh token');
+                this.keycloak.logout();
+            });
+        };
     }
 
     setupEventListeners() {
-        // Login form
-        const loginForm = document.getElementById('loginFormElement');
-        if (loginForm) {
-            loginForm.addEventListener('submit', this.handleLogin.bind(this));
+        const loginBtn = document.getElementById('loginBtn');
+        if (loginBtn) {
+            loginBtn.addEventListener('click', () => this.keycloak.login());
         }
 
-        // Logout button
         const logoutBtn = document.getElementById('logoutBtn');
         if (logoutBtn) {
-            logoutBtn.addEventListener('click', this.logout.bind(this));
+            logoutBtn.addEventListener('click', () => this.keycloak.logout());
         }
 
-        // Navigation tabs
         document.querySelectorAll('.nav-tab').forEach(tab => {
             tab.addEventListener('click', (e) => {
                 const tabName = e.target.closest('.nav-tab').dataset.tab;
@@ -75,16 +88,13 @@ class RAGApp {
             });
         });
 
-        // File upload
         this.setupFileUpload();
 
-        // Query form
         const submitQueryBtn = document.getElementById('submitQueryBtn');
         if (submitQueryBtn) {
             submitQueryBtn.addEventListener('click', this.handleQuery.bind(this));
         }
 
-        // Document filters
         const refreshDocuments = document.getElementById('refreshDocuments');
         if (refreshDocuments) {
             refreshDocuments.addEventListener('click', this.loadDocuments.bind(this));
@@ -96,6 +106,313 @@ class RAGApp {
         if (statusFilter) statusFilter.addEventListener('change', this.loadDocuments.bind(this));
     }
 
+    // ... (Keep all the other methods like setupFileUpload, handleFileSelection, etc., but update the API calls)
+
+    async apiFetch(url, options = {}) {
+        if (!this.keycloak.authenticated) {
+            throw new Error('User not authenticated');
+        }
+
+        const headers = {
+            ...options.headers,
+            'Authorization': `Bearer ${this.keycloak.token}`
+        };
+
+        const response = await fetch(url, { ...options, headers });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'API request failed');
+        }
+
+        return response.json();
+    }
+
+    async handleFileUpload() {
+        const groupSelect = document.getElementById('groupSelect');
+        const groupId = groupSelect ? groupSelect.value : '';
+
+        if (!groupId) {
+            this.showToast('error', 'Error', 'Please select a group');
+            return;
+        }
+
+        if (!this.selectedFiles || this.selectedFiles.length === 0) {
+            this.showToast('error', 'Error', 'Please select files to upload');
+            return;
+        }
+
+        const uploadProgress = document.getElementById('uploadProgress');
+        const uploadBtn = document.getElementById('uploadBtn');
+
+        if (uploadProgress) uploadProgress.style.display = 'block';
+        if (uploadBtn) uploadBtn.disabled = true;
+
+        try {
+            const formData = new FormData();
+            this.selectedFiles.forEach(file => {
+                formData.append('files', file);
+            });
+            formData.append('group_id', groupId);
+
+            const result = await this.apiFetch(`${this.apiBase}/documents/upload`, {
+                method: 'POST',
+                body: formData
+            });
+
+            this.showToast('success', 'Upload Started',
+                `Started processing ${result.files_count || this.selectedFiles.length} files. Monitor progress in the Jobs tab.`);
+            this.resetUploadForm();
+            this.loadJobs();
+            this.switchTab('jobs');
+
+        } catch (error) {
+            console.error('Upload error:', error);
+            this.showToast('error', 'Upload Failed', error.message);
+            if (uploadProgress) uploadProgress.style.display = 'none';
+            if (uploadBtn) uploadBtn.disabled = false;
+        }
+    }
+
+    async handleQuery() {
+        const queryInput = document.getElementById('queryInput');
+        const queryText = queryInput ? queryInput.value.trim() : '';
+
+        if (!queryText) {
+            this.showToast('error', 'Error', 'Please enter a query');
+            return;
+        }
+
+        const submitBtn = document.getElementById('submitQueryBtn');
+        const queryResults = document.getElementById('queryResults');
+        const queryResponse = document.getElementById('queryResponse');
+        const queryStatus = document.getElementById('queryStatus');
+
+        if (submitBtn) submitBtn.disabled = true;
+        if (queryResults) queryResults.style.display = 'block';
+        if (queryResponse) queryResponse.innerHTML = '<div class="loading"><i class="fas fa-spinner fa-spin"></i>Processing your query...</div>';
+        if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Processing';
+
+        try {
+            const result = await this.apiFetch(`${this.apiBase}/query`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ query_text: queryText })
+            });
+
+            this.showToast('success', 'Query Submitted', `Query submitted successfully. You will be notified upon completion.`);
+            if (submitBtn) submitBtn.disabled = false;
+            if (queryInput) queryInput.value = '';
+
+        } catch (error) {
+            console.error('Query error:', error);
+            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${error.message}</div>`;
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    }
+
+    showLogin() {
+        const loginForm = document.getElementById('loginForm');
+        const mainApp = document.getElementById('mainApp');
+
+        if (loginForm) loginForm.style.display = 'flex';
+        if (mainApp) mainApp.style.display = 'none';
+    }
+
+    showMainApp() {
+        const loginForm = document.getElementById('loginForm');
+        const mainApp = document.getElementById('mainApp');
+        const userInfo = document.getElementById('userInfo');
+        const userName = document.getElementById('userName');
+
+        if (loginForm) loginForm.style.display = 'none';
+        if (mainApp) mainApp.style.display = 'block';
+        if (userInfo) userInfo.style.display = 'flex';
+        if (userName && this.user) userName.textContent = this.user.preferred_username;
+
+        this.populateGroupSelects();
+        this.loadDocuments();
+        this.loadJobs();
+    }
+
+    populateGroupSelects() {
+        if (!this.user) return;
+
+        // Normalize groups to an array of strings
+        const rawGroups = this.user.groups ?? this.user.group ?? null;
+        const groups = Array.isArray(rawGroups)
+            ? rawGroups
+            : (rawGroups ? [rawGroups] : []);
+        this.user.groups = groups;
+
+        const groupSelect = document.getElementById('groupSelect');
+        const groupFilter = document.getElementById('groupFilter');
+
+        const personalOption = document.createElement('option');
+        personalOption.value = this.user.sub; // Use user's subject ID for personal group
+        personalOption.textContent = 'Personal';
+
+        if (groupSelect) {
+            groupSelect.innerHTML = '<option value="">Select a group...</option>';
+            groupSelect.appendChild(personalOption.cloneNode(true));
+            this.user.groups.forEach(group => {
+                const option = document.createElement('option');
+                option.value = group;
+                option.textContent = group;
+                groupSelect.appendChild(option);
+            });
+        }
+
+        if (groupFilter) {
+            groupFilter.innerHTML = '<option value="">All Groups</option>';
+            groupFilter.appendChild(personalOption.cloneNode(true));
+            this.user.groups.forEach(group => {
+                const option = document.createElement('option');
+                option.value = group;
+                option.textContent = group;
+                groupFilter.appendChild(option);
+            });
+        }
+    }
+
+    async loadDocuments() {
+        const documentsGrid = document.getElementById('documentsGrid');
+        const documentsLoading = document.getElementById('documentsLoading');
+        const groupFilter = document.getElementById('groupFilter');
+        const statusFilter = document.getElementById('statusFilter');
+
+        if (documentsLoading) documentsLoading.style.display = 'flex';
+        if (documentsGrid) documentsGrid.innerHTML = '';
+
+        try {
+            const params = new URLSearchParams();
+            if (groupFilter && groupFilter.value) params.append('group_id', groupFilter.value);
+            if (statusFilter && statusFilter.value) params.append('status', statusFilter.value);
+            params.append('limit', '50');
+
+            const result = await this.apiFetch(`${this.apiBase}/documents?${params}`);
+            this.displayDocuments(result.documents || []);
+
+        } catch (error) {
+            console.error('Error loading documents:', error);
+            if (documentsGrid) {
+                documentsGrid.innerHTML = `<div class="error-message">Failed to load documents: ${error.message}</div>`;
+            }
+        } finally {
+            if (documentsLoading) documentsLoading.style.display = 'none';
+        }
+    }
+
+    async deleteDocument(documentId) {
+        if (!confirm('Are you sure you want to delete this document?')) {
+            return;
+        }
+
+        try {
+            await this.apiFetch(`${this.apiBase}/documents/${documentId}`, { method: 'DELETE' });
+            this.showToast('success', 'Document Deleted', 'Document deleted successfully');
+            this.loadDocuments();
+        } catch (error) {
+            console.error('Delete error:', error);
+            this.showToast('error', 'Delete Failed', error.message);
+        }
+    }
+
+    async loadJobs() {
+        const jobsList = document.getElementById('jobsList');
+        const jobsLoading = document.getElementById('jobsLoading');
+        const activeJobs = document.getElementById('activeJobs');
+        const completedJobs = document.getElementById('completedJobs');
+        const failedJobs = document.getElementById('failedJobs');
+
+        if (jobsLoading) jobsLoading.style.display = 'flex';
+        if (jobsList) jobsList.innerHTML = '';
+
+        try {
+            const result = await this.apiFetch(`${this.apiBase}/jobs`);
+            const jobs = result.jobs || [];
+            this.displayJobs(jobs);
+
+            const stats = this.calculateJobStats(jobs);
+            if (activeJobs) activeJobs.textContent = stats.active;
+            if (completedJobs) completedJobs.textContent = stats.completed;
+            if (failedJobs) failedJobs.textContent = stats.failed;
+
+        } catch (error) {
+            console.error('Error loading jobs:', error);
+            if (jobsList) {
+                jobsList.innerHTML = `<div class="error-message">Failed to load jobs: ${error.message}</div>`;
+            }
+        } finally {
+            if (jobsLoading) jobsLoading.style.display = 'none';
+        }
+    }
+
+    async cancelJob(jobId) {
+        if (!confirm('Are you sure you want to cancel this job?')) {
+            return;
+        }
+
+        try {
+            await this.apiFetch(`${this.apiBase}/jobs/${jobId}`, { method: 'DELETE' });
+            this.showToast('success', 'Job Cancelled', 'Job cancelled successfully');
+            this.loadJobs();
+        } catch (error) {
+            console.error('Cancel error:', error);
+            this.showToast('error', 'Cancel Failed', error.message);
+        }
+    }
+
+    connectWebSocket() {
+        if (this.websocket) {
+            this.websocket.close();
+        }
+
+        try {
+            const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.keycloak.token)}`;
+            this.websocket = new WebSocket(wsUrlWithToken);
+
+            this.websocket.onopen = () => {
+                console.log('WebSocket connected');
+                this.reconnectAttempts = 0;
+                this.updateConnectionStatus('connected');
+                this.startHeartbeat();
+            };
+
+            this.websocket.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    this.handleWebSocketMessage(message);
+                } catch (error) {
+                    console.error('WebSocket message parse error:', error);
+                }
+            };
+
+            this.websocket.onclose = () => {
+                console.log('WebSocket disconnected');
+                this.updateConnectionStatus('disconnected');
+                this.scheduleReconnect();
+            };
+
+            this.websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                this.updateConnectionStatus('disconnected');
+            };
+
+        } catch (error) {
+            console.error('WebSocket connection error:', error);
+            this.updateConnectionStatus('disconnected');
+            this.scheduleReconnect();
+        }
+    }
+
+    // ... (Keep all other methods like displayDocuments, displayJobs, handleWebSocketMessage, etc. as they are)
+    // Make sure to copy the remaining methods from the old file here.
+
+    // NOTE: The following methods are copied from the old file and should be kept.
     setupFileUpload() {
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
@@ -103,7 +420,6 @@ class RAGApp {
 
         if (!uploadArea || !fileInput || !uploadBtn) return;
 
-        // Drag and drop
         uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
             uploadArea.classList.add('dragover');
@@ -133,7 +449,6 @@ class RAGApp {
         });
 
         uploadBtn.addEventListener('click', (e) => {
-            console.log('Upload button clicked');
             this.handleFileUpload();
         });
     }
@@ -146,13 +461,9 @@ class RAGApp {
 
         if (!fileList || !selectedFiles) return;
 
-        // Clear previous selection
         selectedFiles.innerHTML = '';
-
-        // Store files for upload
         this.selectedFiles = files;
 
-        // Display selected files
         files.forEach((file, index) => {
             const fileItem = document.createElement('div');
             fileItem.className = 'file-item';
@@ -191,66 +502,6 @@ class RAGApp {
         }
     }
 
-    async handleFileUpload() {
-        console.log('handleFileUpload called');
-        const groupSelect = document.getElementById('groupSelect');
-        const groupId = groupSelect ? groupSelect.value : '';
-        console.log('Group ID:', groupId);
-        console.log('Selected files:', this.selectedFiles);
-
-        if (!groupId) {
-            console.log('No group selected');
-            this.showToast('error', 'Error', 'Please select a group');
-            return;
-        }
-
-        if (!this.selectedFiles || this.selectedFiles.length === 0) {
-            console.log('No files selected');
-            this.showToast('error', 'Error', 'Please select files to upload');
-            return;
-        }
-
-        const uploadProgress = document.getElementById('uploadProgress');
-        const uploadBtn = document.getElementById('uploadBtn');
-
-        if (uploadProgress) uploadProgress.style.display = 'block';
-        if (uploadBtn) uploadBtn.disabled = true;
-
-        try {
-            const formData = new FormData();
-            this.selectedFiles.forEach(file => {
-                formData.append('files', file);
-            });
-            formData.append('group_id', groupId);
-
-            const response = await fetch(`${this.apiBase}/documents/upload`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                },
-                body: formData
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Upload failed');
-            }
-
-            const result = await response.json();
-            this.showToast('success', 'Upload Started',
-                `Started processing ${result.files_count || this.selectedFiles.length} files. Monitor progress in the Jobs tab.`);
-            this.resetUploadForm();
-            this.loadJobs();
-            this.switchTab('jobs');
-
-        } catch (error) {
-            console.error('Upload error:', error);
-            this.showToast('error', 'Upload Failed', error.message);
-            if (uploadProgress) uploadProgress.style.display = 'none';
-            if (uploadBtn) uploadBtn.disabled = false;
-        }
-    }
-
     resetUploadForm() {
         const fileList = document.getElementById('fileList');
         const uploadProgress = document.getElementById('uploadProgress');
@@ -264,256 +515,19 @@ class RAGApp {
         this.selectedFiles = [];
     }
 
-    async handleQuery() {
-        const queryInput = document.getElementById('queryInput');
-        const queryText = queryInput ? queryInput.value.trim() : '';
-
-        if (!queryText) {
-            this.showToast('error', 'Error', 'Please enter a query');
-            return;
-        }
-
-        const submitBtn = document.getElementById('submitQueryBtn');
-        const queryResults = document.getElementById('queryResults');
-        const queryResponse = document.getElementById('queryResponse');
-        const queryStatus = document.getElementById('queryStatus');
-
-        if (submitBtn) submitBtn.disabled = true;
-        if (queryResults) queryResults.style.display = 'block';
-        if (queryResponse) queryResponse.innerHTML = '<div class="loading"><i class="fas fa-spinner fa-spin"></i>Processing your query...</div>';
-        if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-clock"></i> Status: Processing';
-
-        try {
-            const response = await fetch(`${this.apiBase}/query`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.token}`
-                },
-                body: JSON.stringify({ query_text: queryText })
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Query failed');
-            }
-
-            const result = await response.json();
-            this.showToast('success', 'Query Submitted', `Query submitted successfully. You will be notified upon completion.`);
-            if (submitBtn) submitBtn.disabled = false;
-            if (queryInput) queryInput.value = '';
-
-        } catch (error) {
-            console.error('Query error:', error);
-            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${error.message}</div>`;
-            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
-            if (submitBtn) submitBtn.disabled = false;
-        }
-    }
-
-    
-
-    async handleLogin(e) {
-        e.preventDefault();
-
-        const username = document.getElementById('username');
-        const password = document.getElementById('password');
-        const loginError = document.getElementById('loginError');
-
-        if (!username || !password) {
-            console.error('Username or password input not found');
-            return;
-        }
-
-        const usernameValue = username.value;
-        const passwordValue = password.value;
-
-        if (loginError) loginError.style.display = 'none';
-
-        try {
-            console.log('Attempting login for user:', usernameValue);
-
-            const response = await fetch(`${this.apiBase}/auth/login`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    username: usernameValue,
-                    password: passwordValue
-                })
-            });
-
-            console.log('Login response status:', response.status);
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Login failed');
-            }
-
-            const result = await response.json();
-            console.log('Login successful:', result);
-
-            this.token = result.access_token;
-            this.user = {
-                user_id: result.user_id,
-                username: result.username,
-                groups: result.groups
-            };
-
-            localStorage.setItem('auth_token', this.token);
-
-            this.showMainApp();
-            this.connectWebSocket();
-
-        } catch (error) {
-            console.error('Login error:', error);
-            if (loginError) {
-                loginError.textContent = error.message;
-                loginError.style.display = 'block';
-            } else {
-                alert('Login failed: ' + error.message);
-            }
-        }
-    }
-
-    async logout() {
-        try {
-            if (this.token) {
-                await fetch(`${this.apiBase}/auth/logout`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${this.token}`
-                    }
-                });
-            }
-        } catch (error) {
-            console.error('Logout error:', error);
-        }
-
-        this.token = null;
-        this.user = null;
-        localStorage.removeItem('auth_token');
-
-        if (this.websocket) {
-            this.websocket.close();
-            this.websocket = null;
-        }
-
-        this.showLogin();
-    }
-
-    async validateSession() {
-        const response = await fetch(`${this.apiBase}/auth/session`, {
-            headers: {
-                'Authorization': `Bearer ${this.token}`
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error('Session validation failed');
-        }
-
-        const session = await response.json();
-        this.user = {
-            user_id: session.user_id,
-            username: session.username,
-            groups: session.groups
-        };
-    }
-
-    showLogin() {
-        console.log('showLogin() called');
-        const loginForm = document.getElementById('loginForm');
-        const mainApp = document.getElementById('mainApp');
-        const userInfo = document.getElementById('userInfo');
-
-        console.log('loginForm element:', loginForm);
-        console.log('mainApp element:', mainApp);
-        console.log('userInfo element:', userInfo);
-
-        if (loginForm) {
-            loginForm.style.display = 'flex';
-            console.log('Login form display set to flex');
-        }
-        if (mainApp) {
-            mainApp.style.display = 'none';
-            console.log('Main app display set to none');
-        }
-        if (userInfo) {
-            userInfo.style.display = 'none';
-            console.log('User info display set to none');
-        }
-
-        console.log('Login form should now be visible');
-    }
-
-    showMainApp() {
-        const loginForm = document.getElementById('loginForm');
-        const mainApp = document.getElementById('mainApp');
-        const userInfo = document.getElementById('userInfo');
-        const userName = document.getElementById('userName');
-
-        if (loginForm) loginForm.style.display = 'none';
-        if (mainApp) mainApp.style.display = 'block';
-        if (userInfo) userInfo.style.display = 'flex';
-        if (userName && this.user) userName.textContent = this.user.username;
-
-        this.populateGroupSelects();
-        this.loadDocuments();
-        this.loadJobs();
-    }
-
-    populateGroupSelects() {
-        if (!this.user || !this.user.groups) return;
-
-        const groupSelect = document.getElementById('groupSelect');
-        const groupFilter = document.getElementById('groupFilter');
-
-        const personalOption = document.createElement('option');
-        // Use canonical group id for personal scope
-        personalOption.value = this.user.user_id;
-        personalOption.textContent = 'Personal';
-
-        if (groupSelect) {
-            groupSelect.innerHTML = '<option value="">Select a group...</option>';
-            groupSelect.appendChild(personalOption.cloneNode(true));
-            this.user.groups.forEach(group => {
-                const option = document.createElement('option');
-                option.value = group;
-                option.textContent = group;
-                groupSelect.appendChild(option);
-            });
-        }
-
-        if (groupFilter) {
-            groupFilter.innerHTML = '<option value="">All Groups</option>';
-            groupFilter.appendChild(personalOption.cloneNode(true));
-            this.user.groups.forEach(group => {
-                const option = document.createElement('option');
-                option.value = group;
-                option.textContent = group;
-                groupFilter.appendChild(option);
-            });
-        }
-    }
-
     switchTab(tabName) {
-        // Update tab buttons
         document.querySelectorAll('.nav-tab').forEach(tab => {
             tab.classList.remove('active');
         });
         const activeTab = document.querySelector(`[data-tab="${tabName}"]`);
         if (activeTab) activeTab.classList.add('active');
 
-        // Update tab content
         document.querySelectorAll('.tab-pane').forEach(pane => {
             pane.classList.remove('active');
         });
         const activePane = document.getElementById(`${tabName}Tab`);
         if (activePane) activePane.classList.add('active');
 
-        // Load data for specific tabs
         if (tabName === 'documents') {
             this.loadDocuments();
         } else if (tabName === 'jobs') {
@@ -521,45 +535,6 @@ class RAGApp {
             this.startJobsAutoRefresh();
         } else {
             this.stopJobsAutoRefresh();
-        }
-    }
-
-    async loadDocuments() {
-        const documentsGrid = document.getElementById('documentsGrid');
-        const documentsLoading = document.getElementById('documentsLoading');
-        const groupFilter = document.getElementById('groupFilter');
-        const statusFilter = document.getElementById('statusFilter');
-
-        if (documentsLoading) documentsLoading.style.display = 'flex';
-        if (documentsGrid) documentsGrid.innerHTML = '';
-
-        try {
-            const params = new URLSearchParams();
-            if (groupFilter && groupFilter.value) params.append('group_id', groupFilter.value);
-            if (statusFilter && statusFilter.value) params.append('status', statusFilter.value);
-            params.append('limit', '50');
-
-            const response = await fetch(`${this.apiBase}/documents?${params}`, {
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                }
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to load documents');
-            }
-
-            const result = await response.json();
-            console.log('Documents loaded:', result);
-            this.displayDocuments(result.documents || []);
-
-        } catch (error) {
-            console.error('Error loading documents:', error);
-            if (documentsGrid) {
-                documentsGrid.innerHTML = `<div class="error-message">Failed to load documents: ${error.message}</div>`;
-            }
-        } finally {
-            if (documentsLoading) documentsLoading.style.display = 'none';
         }
     }
 
@@ -607,74 +582,6 @@ class RAGApp {
                 </div>
             </div>
         `).join('');
-    }
-
-    async deleteDocument(documentId) {
-        if (!confirm('Are you sure you want to delete this document?')) {
-            return;
-        }
-
-        try {
-            const response = await fetch(`${this.apiBase}/documents/${documentId}`, {
-                method: 'DELETE',
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                }
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Delete failed');
-            }
-
-            this.showToast('success', 'Document Deleted', 'Document deleted successfully');
-            this.loadDocuments();
-
-        } catch (error) {
-            console.error('Delete error:', error);
-            this.showToast('error', 'Delete Failed', error.message);
-        }
-    }
-
-    async loadJobs() {
-        const jobsList = document.getElementById('jobsList');
-        const jobsLoading = document.getElementById('jobsLoading');
-        const activeJobs = document.getElementById('activeJobs');
-        const completedJobs = document.getElementById('completedJobs');
-        const failedJobs = document.getElementById('failedJobs');
-
-        if (jobsLoading) jobsLoading.style.display = 'flex';
-        if (jobsList) jobsList.innerHTML = '';
-
-        try {
-            const response = await fetch(`${this.apiBase}/jobs`, {
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                }
-            });
-
-            if (!response.ok) {
-                throw new Error('Failed to load jobs');
-            }
-
-            const result = await response.json();
-            const jobs = result.jobs || [];
-            this.displayJobs(jobs);
-
-            // Update summary
-            const stats = this.calculateJobStats(jobs);
-            if (activeJobs) activeJobs.textContent = stats.active;
-            if (completedJobs) completedJobs.textContent = stats.completed;
-            if (failedJobs) failedJobs.textContent = stats.failed;
-
-        } catch (error) {
-            console.error('Error loading jobs:', error);
-            if (jobsList) {
-                jobsList.innerHTML = `<div class="error-message">Failed to load jobs: ${error.message}</div>`;
-            }
-        } finally {
-            if (jobsLoading) jobsLoading.style.display = 'none';
-        }
     }
 
     calculateJobStats(jobs) {
@@ -734,81 +641,8 @@ class RAGApp {
         `).join('');
     }
 
-    async cancelJob(jobId) {
-        if (!confirm('Are you sure you want to cancel this job?')) {
-            return;
-        }
-
-        try {
-            const response = await fetch(`${this.apiBase}/jobs/${jobId}`, {
-                method: 'DELETE',
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                }
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Cancel failed');
-            }
-
-            this.showToast('success', 'Job Cancelled', 'Job cancelled successfully');
-            this.loadJobs();
-
-        } catch (error) {
-            console.error('Cancel error:', error);
-            this.showToast('error', 'Cancel Failed', error.message);
-        }
-    }
-
-    connectWebSocket() {
-        if (this.websocket) {
-            this.websocket.close();
-        }
-
-        try {
-            // Add token as query parameter
-            const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.token)}`;
-            this.websocket = new WebSocket(wsUrlWithToken);
-
-            this.websocket.onopen = () => {
-                console.log('WebSocket connected');
-                this.reconnectAttempts = 0;
-                this.updateConnectionStatus('connected');
-
-                // Start heartbeat
-                this.startHeartbeat();
-            };
-
-            this.websocket.onmessage = (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    this.handleWebSocketMessage(message);
-                } catch (error) {
-                    console.error('WebSocket message parse error:', error);
-                }
-            };
-
-            this.websocket.onclose = () => {
-                console.log('WebSocket disconnected');
-                this.updateConnectionStatus('disconnected');
-                this.scheduleReconnect();
-            };
-
-            this.websocket.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                this.updateConnectionStatus('disconnected');
-            };
-
-        } catch (error) {
-            console.error('WebSocket connection error:', error);
-            this.updateConnectionStatus('disconnected');
-            this.scheduleReconnect();
-        }
-    }
-
     scheduleReconnect() {
-        if (this.reconnectAttempts < this.maxReconnectAttempts && this.token) {
+        if (this.reconnectAttempts < this.maxReconnectAttempts && this.keycloak.authenticated) {
             this.reconnectAttempts++;
             this.updateConnectionStatus('connecting');
 
@@ -824,11 +658,9 @@ class RAGApp {
 
         switch (message.type) {
             case 'pong':
-                // Handle pong response to ping - just update connection status
                 console.log('Received pong from server');
                 break;
             case 'job_notification': {
-                // Backend sends job details under message.job
                 if (message.job) {
                     this.handleJobUpdate({
                         job_id: message.job.job_id,
@@ -839,7 +671,6 @@ class RAGApp {
                 break;
             }
             case 'job_progress': {
-                // Lightweight progress update
                 this.handleJobUpdate({
                     job_id: message.job_id,
                     status: 'processing',
@@ -869,7 +700,6 @@ class RAGApp {
     }
 
     handleJobUpdate(jobData) {
-        // Update job progress in real-time
         const jobCard = document.querySelector(`[data-job-id="${jobData.job_id}"]`);
         if (jobCard) {
             const progressFill = jobCard.querySelector('.job-progress-fill');
@@ -891,7 +721,6 @@ class RAGApp {
         if (jobData.status === 'completed' || jobData.status === 'failed') {
             this.loadDocuments();
             this.loadJobs();
-            // Stop auto-refresh if no active jobs remain
             setTimeout(() => this.maybeStopJobsAutoRefresh(), 0);
         }
     }
@@ -936,7 +765,6 @@ class RAGApp {
     }
 
     startHeartbeat() {
-        // Send periodic heartbeat to keep connection alive
         if (this.heartbeatInterval) {
             clearInterval(this.heartbeatInterval);
         }
@@ -945,7 +773,7 @@ class RAGApp {
             if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
                 this.websocket.send(JSON.stringify({ type: 'ping' }));
             }
-        }, 30000); // Every 30 seconds
+        }, 30000);
     }
 
     updateConnectionStatus(status) {
@@ -974,7 +802,6 @@ class RAGApp {
     showToast(level, title, message) {
         const toastContainer = document.getElementById('toastContainer');
         if (!toastContainer) {
-            // If no toast container, fall back to console and alert
             console.log(`${level.toUpperCase()}: ${title} - ${message}`);
             if (level === 'error') {
                 alert(`Error: ${message}`);
@@ -996,7 +823,6 @@ class RAGApp {
 
         toastContainer.appendChild(toast);
 
-        // Auto-remove after 5 seconds
         setTimeout(() => {
             if (toast.parentElement) {
                 toast.remove();
@@ -1004,7 +830,6 @@ class RAGApp {
         }, 5000);
     }
 
-    // Utility functions
     formatFileSize(bytes) {
         if (bytes === 0) return '0 Bytes';
         const k = 1024;
@@ -1048,12 +873,10 @@ class RAGApp {
     }
 
     isSupportedFileType(file) {
-        // Check by MIME type first
         if (this.supportedFileTypes[file.type]) {
             return true;
         }
         
-        // Fallback to file extension check
         const fileName = file.name.toLowerCase();
         const supportedExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.xls', '.html', '.md', '.csv'];
         return supportedExtensions.some(ext => fileName.endsWith(ext));
@@ -1112,8 +935,6 @@ class RAGApp {
     }
 }
 
-// Initialize the application when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('DOM loaded, initializing RAGApp...');
     window.app = new RAGApp();
 });

@@ -20,11 +20,11 @@ import uvicorn
 
 from ..shared.config import config
 from ..shared.redis_client import redis_client
-from ..shared.middleware import auth_middleware, rate_limiter
+from ..shared.middleware import rate_limiter, get_current_user, require_roles
 from ..shared.error_handling import error_handler, set_log_context, clear_log_context, StructuredLogger
 from ..shared.monitoring import metric_collector, alert_manager, health_checker, start_monitoring_thread
-from ..shared.models import LoginRequest, LoginResponse, ErrorResponse, UserSession, Document
-from ..shared.auth import auth_manager, AuthenticationError, InvalidCredentialsError, TokenExpiredError, TokenInvalidError
+from ..shared.models import Document, User
+from ..shared.auth import auth_manager, AuthenticationError, TokenExpiredError, TokenInvalidError
 
 # Set up structured logging
 logger = StructuredLogger(__name__)
@@ -32,22 +32,7 @@ logger = StructuredLogger(__name__)
 # Security
 security = HTTPBearer()
 
-# Authentication dependency functions
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> UserSession:
-    """Get current authenticated user."""
-    return await auth_middleware.get_current_user(credentials)
 
-async def get_current_user_optional(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[UserSession]:
-    """Get current authenticated user (optional)."""
-    return await auth_middleware.get_current_user_optional(credentials)
-
-async def validate_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
-    """Validate token endpoint."""
-    return await auth_middleware.validate_token_endpoint(credentials)
-
-def require_permissions(*permissions: str):
-    """Require specific permissions."""
-    return auth_middleware.require_permissions(*permissions)
 
 
 class RequestLoggingMiddleware:
@@ -154,6 +139,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting FastAPI application...")
     
     try:
+        # Load Keycloak public keys
+        await auth_manager.load_jwks()
+        logger.info("Authentication manager initialized with Keycloak.")
+
         # Check Redis connection
         if not redis_client.health_check():
             logger.warning("Redis connection failed")
@@ -402,7 +391,7 @@ async def api_status():
 # Enhanced monitoring and error handling endpoints
 @app.get("/api/monitoring/metrics", tags=["Monitoring"])
 async def get_system_metrics(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get current system metrics.
@@ -419,7 +408,7 @@ async def get_system_metrics(
         
         return {
             "metrics": metrics.to_dict(),
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -434,7 +423,7 @@ async def get_system_metrics(
 @app.get("/api/monitoring/metrics/history", tags=["Monitoring"])
 async def get_metrics_history(
     hours: int = 24,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get historical system metrics.
@@ -459,7 +448,7 @@ async def get_metrics_history(
         return {
             "metrics_history": history,
             "period_hours": hours,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -475,7 +464,7 @@ async def get_metrics_history(
 
 @app.get("/api/monitoring/alerts", tags=["Monitoring"])
 async def get_active_alerts(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get all active system alerts.
@@ -492,7 +481,7 @@ async def get_active_alerts(
         return {
             "active_alerts": active_alerts,
             "alert_count": len(active_alerts),
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -507,7 +496,7 @@ async def get_active_alerts(
 @app.get("/api/monitoring/alerts/history", tags=["Monitoring"])
 async def get_alert_history(
     hours: int = 24,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get alert history.
@@ -532,7 +521,7 @@ async def get_alert_history(
         return {
             "alert_history": history,
             "period_hours": hours,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -549,7 +538,7 @@ async def get_alert_history(
 @app.get("/api/monitoring/errors", tags=["Monitoring"])
 async def get_error_statistics(
     days: int = 7,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get error statistics and recent errors.
@@ -575,7 +564,7 @@ async def get_error_statistics(
         return {
             "error_statistics": error_stats,
             "recent_errors": recent_errors,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -591,7 +580,7 @@ async def get_error_statistics(
 
 @app.get("/api/monitoring/health/detailed", tags=["Monitoring"])
 async def get_detailed_health_status(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get detailed health status of all system components.
@@ -626,7 +615,7 @@ async def get_detailed_health_status(
                 ]),
                 "critical_alert_count": len(critical_alerts)
             },
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -642,7 +631,7 @@ async def get_detailed_health_status(
 @app.get("/api/performance/query", tags=["Performance"])
 async def get_query_performance_metrics(
     days: int = 7,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get query performance metrics and statistics.
@@ -668,7 +657,7 @@ async def get_query_performance_metrics(
         
         return {
             "query_performance": stats,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -685,7 +674,7 @@ async def get_query_performance_metrics(
 @app.get("/api/performance/embedding", tags=["Performance"])
 async def get_embedding_performance_metrics(
     days: int = 7,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get embedding performance metrics and statistics.
@@ -711,7 +700,7 @@ async def get_embedding_performance_metrics(
         
         return {
             "embedding_performance": stats,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -727,7 +716,7 @@ async def get_embedding_performance_metrics(
 
 @app.get("/api/performance/system", tags=["Performance"])
 async def get_system_performance_metrics(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get overall system performance metrics.
@@ -773,7 +762,7 @@ async def get_system_performance_metrics(
         
         return {
             "system_performance": system_performance,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -787,7 +776,7 @@ async def get_system_performance_metrics(
 
 @app.get("/api/performance/cache", tags=["Performance"])
 async def get_cache_performance_metrics(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get cache performance metrics and statistics.
@@ -812,7 +801,7 @@ async def get_cache_performance_metrics(
         
         return {
             "cache_performance": cache_performance,
-            "requested_by": current_user.user_id,
+            "requested_by": current_user.id,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
@@ -824,353 +813,7 @@ async def get_cache_performance_metrics(
         )
 
 
-# Authentication and API endpoints
 
-@app.post("/api/auth/login", response_model=LoginResponse, tags=["Authentication"])
-async def login(
-    request: Request,
-    login_data: LoginRequest,
-    rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 300))  # 5 attempts per 5 minutes
-):
-    """
-    Authenticate user and create session.
-    
-    Args:
-        request: FastAPI request object
-        login_data: Login credentials
-        rate_limit: Rate limiting dependency
-    
-    Returns:
-        LoginResponse: Authentication token and user info
-    
-    Raises:
-        HTTPException: If authentication fails
-    """
-    try:
-        # Authenticate user
-        auth_result = auth_manager.authenticate_user(
-            username=login_data.username,
-            password=login_data.password
-        )
-        
-        logger.info(f"User {login_data.username} logged in successfully")
-        
-        return LoginResponse(
-            access_token=auth_result["access_token"],
-            token_type=auth_result["token_type"],
-            user_id=auth_result["user_id"],
-            groups=auth_result["groups"]
-        )
-    
-    except InvalidCredentialsError:
-        logger.warning(f"Invalid login attempt for user {login_data.username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    except AuthenticationError as e:
-        logger.error(f"Authentication error for user {login_data.username}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication service error"
-        )
-    
-    except Exception as e:
-        logger.error(f"Unexpected login error for user {login_data.username}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login service temporarily unavailable"
-        )
-
-
-@app.post("/api/auth/logout", tags=["Authentication"])
-async def logout(
-    request: Request,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Logout user and invalidate session.
-    
-    Args:
-        request: FastAPI request object
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Logout confirmation
-    """
-    try:
-        # Get token from request headers
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid authorization header"
-            )
-        
-        token = auth_header.split(" ")[1]
-        
-        # Logout user
-        success = auth_manager.logout_user(token)
-        
-        if success:
-            logger.info(f"User {current_user.user_id} logged out successfully")
-            return {"message": "Logged out successfully"}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Logout failed"
-            )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Logout error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Logout service error"
-        )
-
-
-# Removed duplicate session endpoint - using the more complete one below
-
-
-# Document management endpoints - using complete implementation below
-
-
-@app.get("/api/documents", tags=["Documents"])
-async def list_documents(
-    request: Request,
-    group_id: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    List user's documents with filtering and pagination.
-    
-    Args:
-        request: FastAPI request object
-        group_id: Optional group filter
-        status: Optional status filter
-        limit: Maximum number of documents to return
-        offset: Number of documents to skip
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: List of documents with metadata
-    """
-    try:
-        logger.info(f"list_documents called with group_id={group_id}, status={status}")
-        # Handle personal group
-        if group_id == "personal":
-            groups_to_search = [current_user.user_id]
-        elif group_id:
-            if group_id not in current_user.groups:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"User does not have access to group: {group_id}"
-                )
-            groups_to_search = [group_id]
-        else:
-            groups_to_search = current_user.groups
-
-        logger.info(f"Searching for documents in groups: {groups_to_search}")
-        
-        # Get documents from Redis
-        documents = []
-        
-        # Search for user's documents across all groups or specific group
-        
-        for group in groups_to_search:
-            pattern = f"document:{current_user.user_id}:{group}:*"
-            with redis_client.get_connection() as client:
-                keys = client.keys(pattern)
-            
-            logger.info(f"Found {len(keys)} keys in Redis for pattern: {pattern}")
-
-            for key in keys:
-                try:
-                    doc_data = redis_client.get_json(key.decode('utf-8'))
-                    if doc_data:
-                        # Apply status filter if specified
-                        if status and doc_data.get('processing_status') != status:
-                            continue
-                        
-                        # Convert to Document model for validation
-                        document = Document.from_dict(doc_data)
-                        documents.append(document.to_dict())
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to parse document data from key {key}: {e}")
-                    continue
-        
-        logger.info(f"Found {len(documents)} documents in total for user {current_user.user_id}")
-
-        # Sort by upload date (newest first)
-        documents.sort(key=lambda x: x.get('upload_date', 0), reverse=True)
-        
-        # Apply pagination
-        total_count = len(documents)
-        paginated_documents = documents[offset:offset + limit]
-        
-        logger.info(f"Returning {len(paginated_documents)} documents to the frontend")
-
-        return {
-            "documents": paginated_documents,
-            "total_count": total_count,
-            "limit": limit,
-            "offset": offset,
-            "has_more": offset + limit < total_count
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing documents for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document listing service error"
-        )
-
-
-
-
-
-# Query endpoints
-
-
-
-
-
-
-
-
-
-@app.get("/api/auth/session", tags=["Authentication"])
-async def get_session_info(
-    current_user: UserSession = Depends(get_current_user)
-):
-    """
-    Get current session information.
-    
-    Args:
-        current_user: Current authenticated user
-    
-    Returns:
-        dict: Session information
-    """
-    try:
-        return {
-            "session_id": current_user.session_id,
-            "user_id": current_user.user_id,
-            "groups": current_user.groups,
-            "permissions": current_user.permissions,
-            "created_at": current_user.created_at.isoformat() + "Z",
-            "last_activity": current_user.last_activity.isoformat() + "Z",
-            "is_active": current_user.is_active
-        }
-    
-    except Exception as e:
-        logger.error(f"Session info error for user {current_user.user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Session service error"
-        )
-
-
-@app.post("/api/auth/refresh", tags=["Authentication"])
-async def refresh_token(
-    request: Request,
-    rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 refreshes per 5 minutes
-):
-    """
-    Refresh access token.
-    
-    Args:
-        request: FastAPI request object
-        rate_limit: Rate limiting dependency
-    
-    Returns:
-        dict: New access token
-    
-    Raises:
-        HTTPException: If token refresh fails
-    """
-    try:
-        # Get token from request headers
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid authorization header"
-            )
-        
-        token = auth_header.split(" ")[1]
-        
-        # Refresh token
-        refresh_result = auth_manager.refresh_token(token)
-        
-        logger.info(f"Token refreshed for user {refresh_result['user_id']}")
-        
-        return {
-            "access_token": refresh_result["access_token"],
-            "token_type": refresh_result["token_type"],
-            "user_id": refresh_result["user_id"],
-            "groups": refresh_result["groups"],
-            "permissions": refresh_result["permissions"],
-            "expires_in": refresh_result["expires_in"]
-        }
-    
-    except TokenExpiredError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired and cannot be refreshed",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    except TokenInvalidError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {e}",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    except AuthenticationError as e:
-        logger.error(f"Token refresh error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Token refresh service error"
-        )
-    
-    except Exception as e:
-        logger.error(f"Unexpected token refresh error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Token refresh service temporarily unavailable"
-        )
-
-
-@app.post("/api/auth/validate", tags=["Authentication"])
-async def validate_token_endpoint(
-    token_info: dict = Depends(validate_token)
-):
-    """
-    Validate access token.
-    
-    Args:
-        token_info: Token validation result from middleware
-    
-    Returns:
-        dict: Token validation result
-    """
-    return {
-        "valid": token_info["valid"],
-        "user_info": token_info["user_info"],
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
 
 
 # Document management endpoints
@@ -1182,12 +825,70 @@ from typing import List
 from ..shared.job_manager import job_manager, JobType, JobStatus
 from ..workers.celery_app import celery_app
 
+@app.get("/api/documents", tags=["Documents"])
+async def list_documents(
+    group_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    List user's documents with optional filtering.
+    """
+    try:
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Limit must be between 1 and 100")
+
+        documents = redis_client.get_user_documents(current_user.id)
+
+        if group_id:
+            documents = [d for d in documents if d.group_id == group_id]
+
+        if status:
+            documents = [d for d in documents if d.processing_status == status]
+
+        documents = documents[:limit]
+
+        return {
+            "documents": [d.to_dict() for d in documents],
+            "total_count": len(documents)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing documents for user {current_user.id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Document listing service error")
+
+@app.delete("/api/documents/{document_id}", tags=["Documents"])
+async def delete_document(
+    document_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Delete a user's document by id (searching user/group-prefixed keys)."""
+    try:
+        # Try user/group composite key space first (preferred)
+        for group_id in current_user.groups + [current_user.id]:
+            key = f"document:{current_user.id}:{group_id}:{document_id}"
+            if redis_client.delete(key):
+                return {"message": "Document deleted", "document_id": document_id}
+
+        # Fallback to legacy simple key
+        if redis_client.delete(f"document:{document_id}"):
+            return {"message": "Document deleted", "document_id": document_id}
+
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting document {document_id} for user {current_user.id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Document deletion service error")
+
 @app.post("/api/documents/upload", tags=["Documents"])
 async def upload_documents(
     request: Request,
     files: List[UploadFile] = File(...),
     group_id: str = Form(...),
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(require_roles(["assistance"])),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 uploads per 5 minutes
 ):
     """
@@ -1210,19 +911,8 @@ async def upload_documents(
     temp_files = []
     
     try:
-        # Validate permissions
-        if not current_user.has_permission("upload"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have upload permission"
-            )
-        
-        # Handle personal group
-        if group_id == "personal":
-            group_id = current_user.user_id
-
         # Validate group access
-        if group_id not in current_user.groups and group_id != current_user.user_id:
+        if group_id not in current_user.groups and group_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"User does not have access to group: {group_id}"
@@ -1285,7 +975,7 @@ async def upload_documents(
         
         # Create embedding job
         job = job_manager.create_job(
-            user_id=current_user.user_id,
+            user_id=current_user.id,
             job_type=JobType.EMBEDDING,
             metadata={
                 "group_id": group_id,
@@ -1301,7 +991,7 @@ async def upload_documents(
             "process_document_embedding",
             args=[
                 job.job_id,
-                current_user.user_id,
+                current_user.id,
                 group_id,
                 temp_files
             ],
@@ -1312,7 +1002,7 @@ async def upload_documents(
         job.metadata["celery_task_id"] = task.id
         redis_client.set_job(job)
         
-        logger.info(f"Created embedding job {job.job_id} for user {current_user.user_id} with {len(temp_files)} files")
+        logger.info(f"Created embedding job {job.job_id} for user {current_user.id} with {len(temp_files)} files")
         
         return {
             "job_id": job.job_id,
@@ -1340,7 +1030,7 @@ async def upload_documents(
             except Exception as e:
                 logger.warning(f"Failed to cleanup temp directory after error: {e}")
         
-        logger.error(f"Document upload error for user {current_user.user_id}: {e}")
+        logger.error(f"Document upload error for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document upload service error"
@@ -1350,7 +1040,7 @@ async def upload_documents(
 @app.get("/api/documents/{document_id}", tags=["Documents"])
 async def get_document(
     document_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get specific document metadata.
@@ -1369,7 +1059,7 @@ async def get_document(
         # Search for document across user's groups
         document = None
         for group_id in current_user.groups:
-            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_key = f"document:{current_user.id}:{group_id}:{document_id}"
             doc_data = redis_client.get_json(doc_key)
             if doc_data:
                 document = Document.from_dict(doc_data)
@@ -1386,7 +1076,7 @@ async def get_document(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting document {document_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting document {document_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document retrieval service error"
@@ -1399,7 +1089,7 @@ async def get_document(
 @app.get("/api/documents/{document_id}/status", tags=["Documents"])
 async def get_document_status(
     document_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get document processing status.
@@ -1418,7 +1108,7 @@ async def get_document_status(
         # Search for document across user's groups
         document = None
         for group_id in current_user.groups:
-            doc_key = f"document:{current_user.user_id}:{group_id}:{document_id}"
+            doc_key = f"document:{current_user.id}:{group_id}:{document_id}"
             doc_data = redis_client.get_json(doc_key)
             if doc_data:
                 document = Document.from_dict(doc_data)
@@ -1443,7 +1133,7 @@ async def get_document_status(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting document status {document_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting document status {document_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document status service error"
@@ -1462,7 +1152,7 @@ async def list_jobs(
     status: Optional[str] = None,
     active_only: bool = False,
     limit: int = 50,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     List user's jobs with filtering.
@@ -1503,7 +1193,7 @@ async def list_jobs(
         
         # Get user jobs
         jobs = job_manager.get_user_jobs(
-            user_id=current_user.user_id,
+            user_id=current_user.id,
             job_type=job_type_filter,
             status=status_filter,
             active_only=active_only,
@@ -1541,7 +1231,7 @@ async def list_jobs(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error listing jobs for user {current_user.user_id}: {e}")
+        logger.error(f"Error listing jobs for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job listing service error"
@@ -1551,7 +1241,7 @@ async def list_jobs(
 @app.get("/api/jobs/{job_id}", tags=["Jobs"])
 async def get_job(
     job_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get specific job details.
@@ -1576,7 +1266,7 @@ async def get_job(
             )
         
         # Verify job ownership
-        if job.user_id != current_user.user_id:
+        if job.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to job"
@@ -1606,7 +1296,7 @@ async def get_job(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting job {job_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting job {job_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job retrieval service error"
@@ -1616,7 +1306,7 @@ async def get_job(
 @app.post("/api/jobs/{job_id}/cancel", tags=["Jobs"])
 async def cancel_job(
     job_id: str,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 cancellations per 5 minutes
 ):
     """
@@ -1643,7 +1333,7 @@ async def cancel_job(
             )
         
         # Verify job ownership
-        if job.user_id != current_user.user_id:
+        if job.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to job"
@@ -1674,7 +1364,7 @@ async def cancel_job(
             except Exception as e:
                 logger.warning(f"Failed to revoke Celery task {celery_task_id}: {e}")
         
-        logger.info(f"Cancelled job {job_id} for user {current_user.user_id}")
+        logger.info(f"Cancelled job {job_id} for user {current_user.id}")
         
         return {
             "message": "Job cancelled successfully",
@@ -1685,7 +1375,7 @@ async def cancel_job(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error cancelling job {job_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error cancelling job {job_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job cancellation service error"
@@ -1697,7 +1387,7 @@ async def cancel_job(
 @app.get("/api/jobs/{job_id}", tags=["Jobs"])
 async def get_job(
     job_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get specific job details.
@@ -1722,7 +1412,7 @@ async def get_job(
             )
         
         # Verify job ownership
-        if job.user_id != current_user.user_id:
+        if job.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to job"
@@ -1752,7 +1442,7 @@ async def get_job(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting job {job_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting job {job_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job retrieval service error"
@@ -1762,7 +1452,7 @@ async def get_job(
 @app.post("/api/jobs/{job_id}/cancel", tags=["Jobs"])
 async def cancel_job(
     job_id: str,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(10, 300))  # 10 cancellations per 5 minutes
 ):
     """
@@ -1789,7 +1479,7 @@ async def cancel_job(
             )
         
         # Verify job ownership
-        if job.user_id != current_user.user_id:
+        if job.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to job"
@@ -1820,7 +1510,7 @@ async def cancel_job(
             except Exception as e:
                 logger.warning(f"Failed to revoke Celery task {celery_task_id}: {e}")
         
-        logger.info(f"Cancelled job {job_id} for user {current_user.user_id}")
+        logger.info(f"Cancelled job {job_id} for user {current_user.id}")
         
         return {
             "message": "Job cancelled successfully",
@@ -1831,7 +1521,7 @@ async def cancel_job(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error cancelling job {job_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error cancelling job {job_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job cancellation service error"
@@ -1841,7 +1531,7 @@ async def cancel_job(
 @app.delete("/api/jobs/{job_id}", tags=["Jobs"])
 async def delete_job(
     job_id: str,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(20, 300))  # 20 deletions per 5 minutes
 ):
     """
@@ -1868,7 +1558,7 @@ async def delete_job(
             )
         
         # Verify job ownership
-        if job.user_id != current_user.user_id:
+        if job.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to job"
@@ -1890,7 +1580,7 @@ async def delete_job(
                 detail="Failed to delete job"
             )
         
-        logger.info(f"Deleted job {job_id} for user {current_user.user_id}")
+        logger.info(f"Deleted job {job_id} for user {current_user.id}")
         
         return {
             "message": "Job deleted successfully",
@@ -1901,7 +1591,7 @@ async def delete_job(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting job {job_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error deleting job {job_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job deletion service error"
@@ -1910,7 +1600,7 @@ async def delete_job(
 
 @app.get("/api/jobs/stats", tags=["Jobs"])
 async def get_job_statistics(
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get job statistics for the current user.
@@ -1922,16 +1612,16 @@ async def get_job_statistics(
         dict: Job statistics
     """
     try:
-        stats = job_manager.get_job_statistics(user_id=current_user.user_id)
+        stats = job_manager.get_job_statistics(user_id=current_user.id)
         
         return {
-            "user_id": current_user.user_id,
+            "user_id": current_user.id,
             "statistics": stats,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
     
     except Exception as e:
-        logger.error(f"Error getting job statistics for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting job statistics for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job statistics service error"
@@ -1966,7 +1656,7 @@ async def websocket_endpoint(
         # Authenticate and establish connection
         connection = await websocket_manager.connect(websocket, token)
         
-        logger.info(f"WebSocket connection established for user {connection.user_session.user_id}")
+        logger.info(f"WebSocket connection established for user {connection.user.id}")
         
         # Handle incoming messages
         while True:
@@ -2005,7 +1695,7 @@ async def websocket_endpoint(
 
 @app.get("/api/websocket/stats", tags=["WebSocket"])
 async def get_websocket_stats(
-    current_user: UserSession = Depends(require_permissions(["admin"]))
+    current_user: User = Depends(require_roles(["admin"]))
 ):
     """
     Get WebSocket connection statistics (admin only).
@@ -2152,7 +1842,7 @@ async def register_user(
 async def change_password(
     request: Request,
     password_data: dict,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(5, 3600))  # 5 changes per hour
 ):
     """
@@ -2179,7 +1869,7 @@ async def change_password(
         new_password = password_data["new_password"]
         
         # Verify current password
-        user_data = config.USERS.get(current_user.user_id)
+        user_data = config.USERS.get(current_user.id)
         if not user_data or user_data["password"] != current_password:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -2200,12 +1890,10 @@ async def change_password(
             )
         
         # Update password (in production, hash and save to database)
-        config.USERS[current_user.user_id]["password"] = new_password
+        config.USERS[current_user.id]["password"] = new_password
         
-        # Invalidate all user sessions to force re-login
-        auth_manager.logout_all_user_sessions(current_user.user_id)
-        
-        logger.info(f"Password changed for user {current_user.user_id}")
+        # In a Keycloak setup, password changes should be handled via Keycloak APIs.
+        logger.info(f"Password changed for user {current_user.id}")
         
         return {
             "message": "Password changed successfully. Please log in again.",
@@ -2215,7 +1903,7 @@ async def change_password(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Password change error for user {current_user.user_id}: {e}")
+        logger.error(f"Password change error for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Password change service error"
@@ -2231,7 +1919,7 @@ from ..workers.query_worker import process_user_query
 async def submit_query(
     request: Request,
     query_data: QueryRequest,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(30, 300))  # 30 queries per 5 minutes
 ):
     """
@@ -2273,7 +1961,7 @@ async def submit_query(
         
         # Create query record
         query = Query(
-            user_id=current_user.user_id,
+            user_id=current_user.id,
             query_text=query_data.query_text.strip(),
             status="pending"
         )
@@ -2284,7 +1972,7 @@ async def submit_query(
         
         # Create job for tracking
         job = job_manager.create_job(
-            user_id=current_user.user_id,
+            user_id=current_user.id,
             job_type=JobType.QUERY,
             metadata={
                 "query_id": query.query_id,
@@ -2297,7 +1985,7 @@ async def submit_query(
         # Queue query processing task
         task = process_user_query.delay(
             query.query_id,
-            current_user.user_id,
+            current_user.id,
             current_user.groups,
             query_data.query_text.strip()
         )
@@ -2312,7 +2000,7 @@ async def submit_query(
         query_dict["task_id"] = task.id
         redis_client.set_json(query_key, query_dict, expire_seconds=3600)
         
-        logger.info(f"Created query {query.query_id} for user {current_user.user_id}")
+        logger.info(f"Created query {query.query_id} for user {current_user.id}")
         
         return {
             "query_id": query.query_id,
@@ -2325,7 +2013,7 @@ async def submit_query(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Query submission error for user {current_user.user_id}: {e}")
+        logger.error(f"Query submission error for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Query submission service error"
@@ -2335,7 +2023,7 @@ async def submit_query(
 @app.get("/api/query/{query_id}", tags=["Query"])
 async def get_query_result(
     query_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get query result and status.
@@ -2362,7 +2050,7 @@ async def get_query_result(
             )
         
         # Validate user ownership
-        if query_data.get("user_id") != current_user.user_id:
+        if query_data.get("user_id") != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to this query"
@@ -2417,7 +2105,7 @@ async def get_query_result(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting query result {query_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting query result {query_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Query retrieval service error"
@@ -2427,7 +2115,7 @@ async def get_query_result(
 @app.get("/api/query/{query_id}/status", tags=["Query"])
 async def get_query_status(
     query_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get query processing status and progress.
@@ -2454,7 +2142,7 @@ async def get_query_status(
             )
         
         # Validate user ownership
-        if query_data.get("user_id") != current_user.user_id:
+        if query_data.get("user_id") != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to this query"
@@ -2491,7 +2179,7 @@ async def get_query_status(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting query status {query_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error getting query status {query_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Query status service error"
@@ -2504,7 +2192,7 @@ async def list_user_queries(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     List user's query history with filtering and pagination.
@@ -2550,7 +2238,7 @@ async def list_user_queries(
         for key in keys:
             try:
                 query_data = redis_client.get_json(key.decode('utf-8'))
-                if query_data and query_data.get("user_id") == current_user.user_id:
+                if query_data and query_data.get("user_id") == current_user.id:
                     # Apply status filter if specified
                     if status and query_data.get("status") != status:
                         continue
@@ -2592,7 +2280,7 @@ async def list_user_queries(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error listing queries for user {current_user.user_id}: {e}")
+        logger.error(f"Error listing queries for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Query listing service error"
@@ -2602,7 +2290,7 @@ async def list_user_queries(
 @app.delete("/api/query/{query_id}", tags=["Query"])
 async def delete_query(
     query_id: str,
-    current_user: UserSession = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     rate_limit: None = Depends(rate_limiter.create_rate_limiter(50, 300))  # 50 deletions per 5 minutes
 ):
     """
@@ -2631,7 +2319,7 @@ async def delete_query(
             )
         
         # Validate user ownership
-        if query_data.get("user_id") != current_user.user_id:
+        if query_data.get("user_id") != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to this query"
@@ -2661,7 +2349,7 @@ async def delete_query(
         if not redis_client.delete(query_key):
             logger.warning(f"Failed to delete query data for {query_id}")
         
-        logger.info(f"Deleted query {query_id} for user {current_user.user_id}")
+        logger.info(f"Deleted query {query_id} for user {current_user.id}")
         
         return {
             "message": "Query deleted successfully",
@@ -2673,7 +2361,7 @@ async def delete_query(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting query {query_id} for user {current_user.user_id}: {e}")
+        logger.error(f"Error deleting query {query_id} for user {current_user.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Query deletion service error"
@@ -2683,7 +2371,7 @@ async def delete_query(
 @app.get("/api/query/{query_id}/cache", tags=["Query"])
 async def get_query_cache_info(
     query_id: str,
-    current_user: UserSession = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get query cache information and statistics.
@@ -2707,7 +2395,7 @@ async def get_query_cache_info(
             )
         
         # Validate user ownership
-        if query_data.get("user_id") != current_user.user_id:
+        if query_data.get("user_id") != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to this query"
@@ -2716,7 +2404,7 @@ async def get_query_cache_info(
         # Generate cache key for this query
         from ..workers.query_worker import generate_cache_key
         cache_key = generate_cache_key(
-            current_user.user_id,
+            current_user.id,
             current_user.groups,
             query_data.get("query_text", "")
         )

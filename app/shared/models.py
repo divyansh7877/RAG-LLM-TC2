@@ -8,6 +8,52 @@ from typing import Dict, List, Optional, Any, Union
 from pydantic import BaseModel, Field, validator
 import uuid
 
+# Represents the user information extracted from the Keycloak JWT token.
+class User(BaseModel):
+    id: str
+    username: Optional[str] = None
+    email: Optional[str] = None
+    groups: List[str] = []
+    roles: List[str] = []
+
+    # Accept both string and list from tokens for groups/roles
+    @validator('groups', pre=True, always=True)
+    def _normalize_groups(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, list):
+            return v
+        return []
+
+    @validator('roles', pre=True, always=True)
+    def _normalize_roles(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [v]
+        return []
+
+    @property
+    def user_id(self) -> str:
+        """Backward-compatible alias for user id used by existing code."""
+        return self.id
+
+    def has_permission(self, permission: str) -> bool:
+        """Basic permission check mapped to Keycloak roles.
+
+        - "query" requires role "assistance" or "admin".
+        - Fallback: admin has all permissions.
+        """
+        role_set = set(self.roles or [])
+        if 'admin' in role_set:
+            return True
+        if permission == 'query':
+            return 'assistance' in role_set
+        return False
 
 class JobStatus(str, Enum):
     """Job status enumeration."""
@@ -46,40 +92,6 @@ class RedisSerializable(BaseModel):
     def from_dict(cls, data: Dict[str, Any]) -> 'RedisSerializable':
         """Create model from dictionary."""
         return cls.parse_obj(data)
-
-
-class UserSession(RedisSerializable):
-    """User session data model with Redis serialization support."""
-    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique session identifier")
-    user_id: str = Field(..., description="User identifier")
-    groups: List[str] = Field(default_factory=list, description="User groups")
-    created_at: datetime = Field(default_factory=datetime.now, description="Session creation time")
-    last_activity: datetime = Field(default_factory=datetime.now, description="Last activity timestamp")
-    permissions: List[str] = Field(default_factory=list, description="User permissions")
-    is_active: bool = Field(default=True, description="Session active status")
-    
-    @validator('permissions')
-    def validate_permissions(cls, v):
-        """Validate permissions list."""
-        valid_permissions = {'upload', 'query', 'delete', 'admin'}
-        for perm in v:
-            if perm not in valid_permissions:
-                raise ValueError(f"Invalid permission: {perm}")
-        return v
-    
-    def update_activity(self):
-        """Update last activity timestamp."""
-        self.last_activity = datetime.now()
-    
-    def has_permission(self, permission: str) -> bool:
-        """Check if session has specific permission."""
-        return permission in self.permissions
-    
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
-
 
 class Job(RedisSerializable):
     """Job data model for tracking background tasks with Redis serialization."""
@@ -217,20 +229,6 @@ class Query(RedisSerializable):
 
 
 # Pydantic models for API requests/responses
-class LoginRequest(BaseModel):
-    """Login request model."""
-    username: str
-    password: str
-
-
-class LoginResponse(BaseModel):
-    """Login response model."""
-    access_token: str
-    token_type: str = "bearer"
-    user_id: str
-    groups: List[str]
-
-
 class DocumentUploadResponse(BaseModel):
     """Document upload response model."""
     job_id: str
