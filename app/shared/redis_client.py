@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List, Set
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from .config import config
-from .models import UserSession, Job, Document, Query
+from .models import Job, Document, Query
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -148,144 +148,7 @@ class RedisClient:
             logger.error(f"Set JSON error for key '{key}': {e}")
             return False
     
-    # Enhanced session management methods
-    def get_session(self, session_id: str) -> Optional[UserSession]:
-        """Get session data from Redis using Pydantic model."""
-        try:
-            with self.get_connection(use_session_db=True) as client:
-                value = client.get(f"session:{session_id}")
-                if value:
-                    return UserSession.from_redis(value)
-                return None
-        except RedisConnectionError:
-            raise
-        except Exception as e:
-            logger.error(f"Session GET error for session '{session_id}': {e}")
-            return None
     
-    def set_session(self, session: UserSession) -> bool:
-        """Set session data in Redis with expiration using Pydantic model."""
-        try:
-            with self.get_connection(use_session_db=True) as client:
-                expire_seconds = config.SESSION_EXPIRE_HOURS * 3600
-                return bool(client.set(
-                    f"session:{session.session_id}", 
-                    session.to_redis(), 
-                    ex=expire_seconds
-                ))
-        except RedisConnectionError:
-            raise
-        except Exception as e:
-            logger.error(f"Session SET error for session '{session.session_id}': {e}")
-            return False
-    
-    def update_session_activity(self, session_id: str) -> bool:
-        """Update session last activity timestamp."""
-        try:
-            session = self.get_session(session_id)
-            if session:
-                session.update_activity()
-                return self.set_session(session)
-            return False
-        except Exception as e:
-            logger.error(f"Session activity update error for session '{session_id}': {e}")
-            return False
-    
-    def delete_session(self, session_id: str) -> bool:
-        """Delete session from Redis with proper error handling."""
-        try:
-            with self.get_connection(use_session_db=True) as client:
-                return bool(client.delete(f"session:{session_id}"))
-        except RedisConnectionError:
-            raise
-        except Exception as e:
-            logger.error(f"Session DELETE error for session '{session_id}': {e}")
-            return False
-    
-    def get_all_active_sessions(self) -> List[UserSession]:
-        """Get all active sessions from Redis."""
-        try:
-            with self.get_connection(use_session_db=True) as client:
-                pattern = "session:*"
-                keys = client.keys(pattern)
-                sessions = []
-                
-                for key in keys:
-                    try:
-                        value = client.get(key)
-                        if value:
-                            session = UserSession.from_redis(value)
-                            if session.is_active:
-                                sessions.append(session)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse session from key '{key}': {e}")
-                        continue
-                
-                return sessions
-        except RedisConnectionError:
-            raise
-        except Exception as e:
-            logger.error(f"Get all sessions error: {e}")
-            return []
-    
-    def get_user_sessions(self, user_id: str) -> List[UserSession]:
-        """Get all active sessions for a specific user."""
-        try:
-            all_sessions = self.get_all_active_sessions()
-            return [session for session in all_sessions if session.user_id == user_id]
-        except Exception as e:
-            logger.error(f"Get user sessions error for user '{user_id}': {e}")
-            return []
-    
-    def cleanup_expired_sessions(self) -> int:
-        """Clean up expired sessions and return count of cleaned sessions."""
-        try:
-            with self.get_connection(use_session_db=True) as client:
-                pattern = "session:*"
-                keys = client.keys(pattern)
-                cleaned = 0
-                current_time = datetime.now()
-                
-                for key in keys:
-                    try:
-                        value = client.get(key)
-                        if value:
-                            session = UserSession.from_redis(value)
-                            # Check if session is expired based on last activity
-                            expire_time = session.last_activity + timedelta(hours=config.SESSION_EXPIRE_HOURS)
-                            if current_time > expire_time or not session.is_active:
-                                client.delete(key)
-                                cleaned += 1
-                                logger.info(f"Cleaned expired session: {session.session_id}")
-                    except Exception as e:
-                        logger.warning(f"Error processing session key '{key}' during cleanup: {e}")
-                        # Delete corrupted session data
-                        client.delete(key)
-                        cleaned += 1
-                
-                logger.info(f"Cleaned up {cleaned} expired sessions")
-                return cleaned
-        except RedisConnectionError:
-            raise
-        except Exception as e:
-            logger.error(f"Session cleanup error: {e}")
-            return 0
-    
-    def invalidate_user_sessions(self, user_id: str) -> int:
-        """Invalidate all sessions for a specific user."""
-        try:
-            user_sessions = self.get_user_sessions(user_id)
-            invalidated = 0
-            
-            for session in user_sessions:
-                if self.delete_session(session.session_id):
-                    invalidated += 1
-                    logger.info(f"Invalidated session {session.session_id} for user {user_id}")
-            
-            return invalidated
-        except Exception as e:
-            logger.error(f"Error invalidating sessions for user '{user_id}': {e}")
-            return 0
     
     # Job management methods
     def get_job(self, job_id: str) -> Optional[Job]:

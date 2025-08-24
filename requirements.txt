@@ -20,3 +20,5 @@ pydantic
 aiofiles
 psutil
 flower
+Authlib
+joserfc

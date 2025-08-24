@@ -63,14 +63,12 @@ class Config:
     
     # Session settings
     SESSION_EXPIRE_HOURS = int(os.getenv("SESSION_EXPIRE_HOURS", "24"))
-    
-    # User management (prototype - move to database in production)
-    USERS = {
-        "assistant1": {"password": "password1", "groups": ["personal","assistance", "common_rules"]},
-        "assistant2": {"password": "password2", "groups": ["personal","assistance"]},
-        "div": {"password": "1234", "groups": ["personal","assistance","mine"]},
-        "guest": {"password": "password", "groups": ["personal","common_rules"]},
-    }
+
+    # Keycloak configuration
+    KEYCLOAK_SERVER_URL = os.getenv("KEYCLOAK_SERVER_URL", "http://localhost:8080/")
+    KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "fastapi-client")
+    KEYCLOAK_REALM = os.getenv("KEYCLOAK_REALM", "rag_app")
+    KEYCLOAK_ALGORITHM = os.getenv("KEYCLOAK_ALGORITHM", "RS256")
 
 
 # Global config instance

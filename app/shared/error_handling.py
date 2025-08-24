@@ -50,7 +50,6 @@ class ErrorContext:
     exception_type: str
     stack_trace: str
     user_id: Optional[str] = None
-    session_id: Optional[str] = None
     request_id: Optional[str] = None
     endpoint: Optional[str] = None
     user_agent: Optional[str] = None
@@ -162,7 +161,6 @@ class StructuredLogger:
         return {
             'request_id': context.get('request_id', 'N/A'),
             'user_id': context.get('user_id', 'N/A'),
-            'session_id': context.get('session_id', 'N/A')
         }
     
     def info(self, message: str, **kwargs):
@@ -199,7 +197,6 @@ class ErrorHandler:
         # Error categorization rules
         self.categorization_rules = {
             'AuthenticationError': ErrorCategory.AUTHENTICATION,
-            'InvalidCredentialsError': ErrorCategory.AUTHENTICATION,
             'TokenExpiredError': ErrorCategory.AUTHENTICATION,
             'TokenInvalidError': ErrorCategory.AUTHENTICATION,
             'PermissionError': ErrorCategory.AUTHORIZATION,
@@ -290,7 +287,6 @@ class ErrorHandler:
             exception_type=type(exception).__name__,
             stack_trace=traceback.format_exc(),
             user_id=thread_context.get('user_id'),
-            session_id=thread_context.get('session_id'),
             request_id=thread_context.get('request_id'),
             endpoint=thread_context.get('endpoint'),
             user_agent=thread_context.get('user_agent'),

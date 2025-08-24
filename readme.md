@@ -228,3 +228,19 @@ docker-compose up -d
 - **Resource Management:** Intelligent resource allocation and monitoring
 - **Batch Processing:** Optimized batch processing for document uploads
 - **Horizontal Scaling:** Support for multiple worker instances and Redis clustering
+
+---
+
+## 9. Technical Documentation
+
+For more in-depth information on specific aspects of the project, please refer to the following documents:
+
+1.  [Project Overview](docs/PROJECT_OVERVIEW.md)
+2.  [Architecture](docs/ARCHITECTURE.md)
+3.  [Setup and Installation](docs/SETUP.md)
+4.  [Application Startup Guide](docs/APPLICATION_STARTUP_GUIDE.md)
+5.  [Worker Setup and Management](docs/WORKER_SETUP.md)
+6.  [Testing Guide](docs/TESTING_GUIDE.md)
+7.  [Operations Guide](docs/OPERATIONS_GUIDE.md)
+8.  [Keycloak Setup](docs/KEYCLOAK_SETUP.md)
+9.  [Docling Upgrade Summary](docs/DOCLING_UPGRADE_SUMMARY.md)
