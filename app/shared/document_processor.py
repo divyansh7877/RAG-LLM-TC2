@@ -39,7 +39,7 @@ class EmbeddingResult:
 class DocumentProcessor:
     """A service to process and embed documents into a vector store."""
     
-    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings", embed_model_name: str = "./models/gte-large-en-v1.5", device: Optional[str] = None):
+    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings_v2", embed_model_name: str = "./models/gte-large-en-v1.5", device: Optional[str] = None):
         self.logger = StructuredLogger(__name__)
         self.db_path = db_path
         self.table_name = table_name
@@ -56,10 +56,35 @@ class DocumentProcessor:
     def _initialize_vector_store(self):
         """Initializes the LanceDB connection and vector store if not already done."""
         if self.vector_store is None:
-            self.logger.info("Initializing LanceDB vector store...")
-            self.db = get_db_connection()
-            self.vector_store = LanceDBVectorStore(uri=self.db_path, table_name=self.table_name)
-            self.logger.info("LanceDB vector store initialized.")
+            import os as _os
+            resolved_db_path = _os.path.abspath(self.db_path)
+            self.logger.info(
+                f"Initializing LanceDB vector store... path={resolved_db_path}, table={self.table_name}"
+            )
+            try:
+                self.logger.info("Connecting to LanceDB (singleton)...")
+                self.db = get_db_connection()
+                self.logger.info("Connected to LanceDB.")
+            except Exception as e:
+                self.logger.error(f"Failed connecting to LanceDB at {resolved_db_path}: {e}", exc_info=True)
+                raise
+
+            try:
+                self.logger.info("Creating LanceDBVectorStore instance (using existing DB connection if supported)...")
+                try:
+                    # Prefer passing the already-open DB connection to avoid duplicate locks
+                    self.vector_store = LanceDBVectorStore(db=self.db, table_name=self.table_name)  # type: ignore[arg-type]
+                    self.logger.info("LanceDB vector store initialized via db connection.")
+                except TypeError:
+                    # Fallback for older versions that don't accept a 'db' parameter
+                    self.vector_store = LanceDBVectorStore(uri=resolved_db_path, table_name=self.table_name)
+                    self.logger.info("LanceDB vector store initialized via URI.")
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to initialize LanceDBVectorStore at {resolved_db_path} table {self.table_name}: {e}",
+                    exc_info=True,
+                )
+                raise
 
     def process_documents(
         self, 

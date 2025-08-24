@@ -36,7 +36,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         group_id: The group ID to associate with the documents.
         file_paths: A list of absolute paths to the document files.
     """
-    logger.info(f"Embedding job {job_id} started for user '{user_id}'.")
+    logger.info(f"Embedding job {job_id} started for user '{user_id}'/'{group_id}'.")
     job_manager.update_job_status(job_id, JobStatus.PROCESSING)
     try:
         # best-effort notify over websockets that job started
@@ -47,9 +47,14 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
 
     try:
         # Initialize the processor with configuration from the central config
+        table_name = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
+        logger.info(
+            f"Preparing DocumentProcessor with db_path={os.path.abspath(config.LANCEDB_PATH)}, "
+            f"table={table_name}, model={config.EMBEDDING_MODEL_PATH}, device={'cuda' if config.HAS_CUDA else 'cpu'}"
+        )
         processor = DocumentProcessor(
-            db_path=config.LANCEDB_PATH,
-            table_name="document_embeddings",
+            db_path=os.path.abspath(config.LANCEDB_PATH),
+            table_name=table_name,
             embed_model_name=config.EMBEDDING_MODEL_PATH,
             device="cuda" if config.HAS_CUDA else "cpu"
         )
@@ -63,11 +68,13 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         except Exception:
             pass
 
+        logger.info("Calling processor.process_documents ...")
         result = processor.process_documents(
             file_paths=file_paths,
             user_id=user_id,
             group_id=group_id
         )
+        logger.info("processor.process_documents returned result")
 
         if result.success:
             logger.info(f"Embedding job {job_id} completed successfully.")

@@ -46,10 +46,11 @@ start_worker() {
     
     echo -e "${YELLOW}Starting ${worker_name} worker (queue: ${queue}, concurrency: ${concurrency})...${NC}"
     
-    # Use solo pool for embedding worker to avoid fork with fork-unsafe libs
+    # Use solo pool for embedding and query workers to avoid fork with
+    # fork-unsafe libs (PyTorch/CUDA, LanceDB/Arrow). This prevents hangs.
     local pool_arg=""
-    if [ "${worker_name}" = "embeddi_worker" ] || [ "${worker_name}" = "query_worker" ]; then
-        pool_arg="--pool=solo"
+    if [ "${worker_name}" = "embedding_worker" ] || [ "${worker_name}" = "query_worker" ]; then
+        pool_arg="--pool=threads"
     fi
 
     # Start in background using nohup and capture stdout/stderr into log file

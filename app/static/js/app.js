@@ -108,20 +108,45 @@ class RAGApp {
 
     // ... (Keep all the other methods like setupFileUpload, handleFileSelection, etc., but update the API calls)
 
-    async apiFetch(url, options = {}) {
-        if (!this.keycloak.authenticated) {
+    async ensureFreshToken(minValiditySeconds = 30) {
+        if (!this.keycloak) throw new Error('Keycloak not initialized');
+        if (!this.keycloak.authenticated) throw new Error('User not authenticated');
+        try {
+            await this.keycloak.updateToken(minValiditySeconds);
+        } catch (e) {
+            console.error('Token refresh failed:', e);
+            this.keycloak.logout();
             throw new Error('User not authenticated');
         }
+    }
 
-        const headers = {
-            ...options.headers,
-            'Authorization': `Bearer ${this.keycloak.token}`
+    async apiFetch(url, options = {}) {
+        // Ensure token is fresh before making the request
+        await this.ensureFreshToken(30);
+
+        const makeRequest = async () => {
+            const headers = {
+                ...options.headers,
+                'Authorization': `Bearer ${this.keycloak.token}`
+            };
+            return fetch(url, { ...options, headers });
         };
 
-        const response = await fetch(url, { ...options, headers });
+        let response = await makeRequest();
+
+        // If unauthorized, try one refresh + retry
+        if (response.status === 401) {
+            try {
+                await this.ensureFreshToken(30);
+                response = await makeRequest();
+            } catch (_) {
+                // fallthrough to error handling
+            }
+        }
 
         if (!response.ok) {
-            const error = await response.json();
+            let error;
+            try { error = await response.json(); } catch { error = {}; }
             throw new Error(error.detail || 'API request failed');
         }
 
@@ -371,42 +396,50 @@ class RAGApp {
             this.websocket.close();
         }
 
-        try {
-            const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.keycloak.token)}`;
-            this.websocket = new WebSocket(wsUrlWithToken);
-
-            this.websocket.onopen = () => {
-                console.log('WebSocket connected');
-                this.reconnectAttempts = 0;
-                this.updateConnectionStatus('connected');
-                this.startHeartbeat();
-            };
-
-            this.websocket.onmessage = (event) => {
+        // Ensure token is refreshed before opening WS
+        this.ensureFreshToken(30)
+            .then(() => {
                 try {
-                    const message = JSON.parse(event.data);
-                    this.handleWebSocketMessage(message);
+                    const wsUrlWithToken = `${this.wsUrl}?token=${encodeURIComponent(this.keycloak.token)}`;
+                    this.websocket = new WebSocket(wsUrlWithToken);
+
+                    this.websocket.onopen = () => {
+                        console.log('WebSocket connected');
+                        this.reconnectAttempts = 0;
+                        this.updateConnectionStatus('connected');
+                        this.startHeartbeat();
+                    };
+
+                    this.websocket.onmessage = (event) => {
+                        try {
+                            const message = JSON.parse(event.data);
+                            this.handleWebSocketMessage(message);
+                        } catch (error) {
+                            console.error('WebSocket message parse error:', error);
+                        }
+                    };
+
+                    this.websocket.onclose = () => {
+                        console.log('WebSocket disconnected');
+                        this.updateConnectionStatus('disconnected');
+                        this.scheduleReconnect();
+                    };
+
+                    this.websocket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateConnectionStatus('disconnected');
+                    };
                 } catch (error) {
-                    console.error('WebSocket message parse error:', error);
+                    console.error('WebSocket connection error:', error);
+                    this.updateConnectionStatus('disconnected');
+                    this.scheduleReconnect();
                 }
-            };
-
-            this.websocket.onclose = () => {
-                console.log('WebSocket disconnected');
+            })
+            .catch(() => {
+                // Not authenticated; ensure UI reflects it
                 this.updateConnectionStatus('disconnected');
-                this.scheduleReconnect();
-            };
-
-            this.websocket.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                this.updateConnectionStatus('disconnected');
-            };
-
-        } catch (error) {
-            console.error('WebSocket connection error:', error);
-            this.updateConnectionStatus('disconnected');
-            this.scheduleReconnect();
-        }
+                this.showLogin();
+            });
     }
 
     // ... (Keep all other methods like displayDocuments, displayJobs, handleWebSocketMessage, etc. as they are)
