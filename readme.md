@@ -12,7 +12,6 @@ The key goals are:
 - **Production Ready:** Includes comprehensive error handling, monitoring, job management, and real-time updates.
 
 ---
-
 ## 2. Features
 
 - **Concurrent User Support:** Multiple users can simultaneously upload documents and query the system without data leakage or performance issues.
@@ -31,6 +30,9 @@ The key goals are:
 - **Resource Management:** Intelligent resource allocation and monitoring to prevent system overload.
 - **Comprehensive Monitoring:** System health checks, performance metrics, and error tracking.
 - **Multi-Format Document Support:** Advanced document processing using Docling for PDF, DOCX, PPTX, XLSX, HTML, MD, and CSV files with enhanced text extraction and OCR capabilities.
+- **User Management:** Highly secure and centralized user management system using Keycloak.
+- **Database Integration:** Robust relational storage for user data, roles, and metadata powered by PostgreSQL.
+
 
 ---
 
@@ -194,7 +196,7 @@ The system is designed to be modular and easily customizable:
 -   **Document Formats:** The Docling-powered document processor supports multiple formats out of the box. Additional formats can be added by extending the `SUPPORTED_FORMATS` dictionary in `app/shared/pdf_utils.py` as Docling adds support for new formats.
 -   **Document Processing:** The text extraction pipeline can be customized by modifying the Docling converter configuration for format-specific optimizations (OCR settings, table extraction, etc.).
 -   **Workers:** Additional worker types can be added to handle different processing tasks or integrate with external services.
--   **Authentication:** The authentication system can be extended to integrate with external identity providers (LDAP, OAuth, etc.).
+-   **Authentication:** The authentication system has been extended with external identity provider Keycloak + PostGres(LDAP, OAuth, etc.).
 -   **Storage:** The system can be configured to use different vector databases or add additional storage backends.
 
 ---
