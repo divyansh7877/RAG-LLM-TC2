@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DB_PATH = config.LANCEDB_PATH
-TABLE_NAME = "document_embeddings"
+TABLE_NAME = "document_embeddings_v2"
 EMBED_MODEL_NAME = config.EMBEDDING_MODEL_PATH
 LLM_MODEL_PATH = "./models/Llama-3.2-3B-Instruct-IQ3_M.gguf"
 CACHE_EXPIRE_SECONDS = 3600  # 1 hour cache expiration

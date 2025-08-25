@@ -49,10 +49,11 @@ start_worker() {
     # Use solo pool for embedding and query workers to avoid fork with
     # fork-unsafe libs (PyTorch/CUDA, LanceDB/Arrow). This prevents hangs.
     local pool_arg=""
-    if [ "${worker_name}" = "embedding_worker" ] || [ "${worker_name}" = "query_worker" ]; then
+    if [ "${worker_name}" = "embedding_worker" ]; then
         pool_arg="--pool=threads"
+    elif [ "${worker_name}" = "query_worker" ]; then
+        pool_arg="--pool=solo"
     fi
-
     # Start in background using nohup and capture stdout/stderr into log file
     # We manage the PID ourselves for reliability
     nohup celery -A app.workers.celery_app worker \

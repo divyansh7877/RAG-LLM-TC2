@@ -17,8 +17,6 @@ llm_path = hf_hub_download(
     local_dir_use_symlinks=False
 )
 
-
-
 print(f"LLM downloaded to: {llm_path}")
 
 # Download the Embedding Model
@@ -29,3 +27,12 @@ embedding_path = snapshot_download(
     local_dir_use_symlinks=False
 )
 print(f"Embedding model downloaded to: {embedding_path}")
+
+# Download the Reranker (optional; used if ENABLE_RERANKER=1)
+print("\nDownloading Reranker model (cross-encoder/ms-marco-MiniLM-L6-v2)...")
+reranker_path = snapshot_download(
+    repo_id="cross-encoder/ms-marco-MiniLM-L6-v2",
+    local_dir="./models/cross-encoder/ms-marco-MiniLM-L6-v2",
+    local_dir_use_symlinks=False
+)
+print(f"Reranker downloaded to: {reranker_path}")

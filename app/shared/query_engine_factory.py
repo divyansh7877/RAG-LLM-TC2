@@ -15,9 +15,9 @@ from datetime import datetime
 
 from llama_index.core import (
     StorageContext,
-    load_index_from_storage,
     Settings,
     PromptTemplate,
+    VectorStoreIndex,
 )
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.lancedb import LanceDBVectorStore
@@ -35,24 +35,28 @@ from .error_handling import StructuredLogger
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DB_PATH = "./multi_user_db.lance"
-TABLE_NAME = "document_embeddings"
-EMBED_MODEL_NAME = "./models/gte-large-en-v1.5"  # INT8‐quantised, CPU
+# Prefer centralized config and env var overrides to avoid mismatches
+DB_PATH = getattr(config, "LANCEDB_PATH", "./multi_user_db.lance")
+TABLE_NAME = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
+EMBED_MODEL_NAME = getattr(config, "EMBEDDING_MODEL_PATH", "./models/gte-large-en-v1.5")
 GGUF_MODEL_PATH = "./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"  # llama.cpp model
 
-has_cuda = torch.cuda.is_available()
+has_cuda = getattr(config, "HAS_CUDA")
 
 # Runtime knobs
 device = "cuda" if has_cuda else "cpu"  
+EMBEDDING_DEVICE = device
 BEAM_K = 30      # initial ANN beam for MMR
 FINAL_K = 8     # chunks passed to the LLM
 MMR_LAMBDA = 0.1
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANK_MODEL_REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", "./models/cross-encoder/ms-marco-MiniLM-L6-v2")
+RERANK_ENABLED = os.getenv("ENABLE_RERANKER", "1").lower() in ("1", "true", "yes")
 N_THREADS = mp.cpu_count()
 # Optimize for limited GPU memory (3.6 GB)
 # Use partial GPU layers to fit within memory constraints
 N_GPU_LAYERS = -1 if has_cuda else 0  # Use 20 layers on GPU, rest on CPU
-N_BATCH = 128 if has_cuda else 64     # Smaller batch size for limited VRAM
+N_BATCH = 64 if has_cuda else 16     # Smaller batch size for limited VRAM
 
 # ---------------------------------------------------------------------------
 # Prompt enforcing source citations
@@ -78,7 +82,8 @@ class QueryEngineFactory:
     """Thread-safe factory for creating query engines with proper isolation."""
     
     def __init__(self):
-        self._lock = threading.Lock()
+        # Use re-entrant lock to avoid deadlocks when nested getters call each other
+        self._lock = threading.RLock()
         self._embed_model = None
         self._llm = None
         self._vector_store = None
@@ -89,23 +94,40 @@ class QueryEngineFactory:
         self._cache_hits: int = 0
         self._cache_misses: int = 0
         self.logger = StructuredLogger(__name__)
+        self._config_logged = False
+
+    def _log_configuration(self) -> None:
+        """Log important runtime configuration once per process."""
+        if self._config_logged:
+            return
+        self._config_logged = True
+        try:
+            self.logger.info(
+                "[QE] Configuration: "
+                f"DB_PATH={os.path.abspath(DB_PATH)}, TABLE_NAME={TABLE_NAME}, "
+                f"EMBED_MODEL_NAME={EMBED_MODEL_NAME}, GGUF_MODEL_PATH={GGUF_MODEL_PATH}, "
+                f"CUDA={has_cuda}, device={device}, N_GPU_LAYERS={N_GPU_LAYERS}, N_BATCH={N_BATCH}, "
+                f"RERANK_ENABLED={RERANK_ENABLED}, RERANK_MODEL_PATH={RERANK_MODEL_PATH}"
+            )
+        except Exception:
+            pass
     
     def _get_embed_model(self):
         """Get or create the embedding model (singleton per process)."""
         if self._embed_model is None:
             with self._lock:
                 if self._embed_model is None:
-                    # Use GPU for embedding model if available.
-                    # Note: This may require setting the Celery worker start method to 'spawn' or 'forkserver'
-                    # to avoid CUDA multiprocessing issues.
-                    embed_device = device
+                    # Use configured embedding device (default: GPU if available)
+                    embed_device = EMBEDDING_DEVICE
                     
+                    t0 = time.perf_counter()
+                    self.logger.info("[QE] Step 1: Initializing embedding model ...")
                     self._embed_model = HuggingFaceEmbedding(
                         model_name=EMBED_MODEL_NAME,
                         device=embed_device,
                         trust_remote_code=True,
                     )
-                    self.logger.info(f"Initialized embedding model on device: {embed_device}")
+                    self.logger.info(f"[QE] Step 1: Embedding model ready on device={embed_device} (took {(time.perf_counter()-t0):.2f}s)")
         return self._embed_model
     
     def _get_llm(self):
@@ -113,7 +135,8 @@ class QueryEngineFactory:
         if self._llm is None:
             with self._lock:
                 if self._llm is None:
-                    self.logger.info(f"LLM Factory: CUDA available: {has_cuda}, using {N_GPU_LAYERS} GPU layers.")
+                    self.logger.info(f"[QE] Step 2: Initializing LLM (CUDA={has_cuda}, n_gpu_layers={N_GPU_LAYERS}) ...")
+                    t0 = time.perf_counter()
                     if not has_cuda:
                         self.logger.warning("LLM Factory: CUDA not available. LLM will run on CPU. Check PyTorch/CUDA installation and NVIDIA drivers.")
                     self._llm = LlamaCPP(
@@ -127,6 +150,7 @@ class QueryEngineFactory:
                         },
                         verbose=True,
                     )
+                    self.logger.info(f"[QE] Step 2: LLM ready (took {(time.perf_counter()-t0):.2f}s)")
         return self._llm
     
     def _get_vector_store(self):
@@ -134,27 +158,73 @@ class QueryEngineFactory:
         if self._vector_store is None:
             with self._lock:
                 if self._vector_store is None:
-                    self._vector_store = LanceDBVectorStore(
-                        uri=DB_PATH, 
-                        table_name=TABLE_NAME, 
-                        mode="r"
-                    )
+                    preferred_table = TABLE_NAME
+                    try:
+                        # Prefer an existing shared LanceDB connection if available to avoid file locks
+                        self.logger.info(f"[QE] Step 3: Opening LanceDB vector store via shared connection (table={preferred_table}) ...")
+                        t0 = time.perf_counter()
+                        try:
+                            from .lancedb_client import get_db_connection
+                            db = get_db_connection()
+                            self._vector_store = LanceDBVectorStore(db=db, table_name=preferred_table)  # type: ignore[arg-type]
+                            self.logger.info(f"[QE] Step 3: Vector store opened via shared connection (took {(time.perf_counter()-t0):.2f}s)")
+                        except TypeError:
+                            # Older versions may not support db= parameter
+                            self.logger.info(f"[QE] Step 3: Fallback to URI open at {os.path.abspath(DB_PATH)} ...")
+                            self._vector_store = LanceDBVectorStore(
+                                uri=DB_PATH,
+                                table_name=preferred_table,
+                                mode="r",
+                            )
+                            self.logger.info(f"[QE] Step 3: Vector store opened via URI (took {(time.perf_counter()-t0):.2f}s)")
+                    except Exception as primary_err:
+                        # Backward-compat fallback for older table name
+                        fallback_table = "document_embeddings"
+                        if preferred_table != fallback_table:
+                            self.logger.warning(
+                                f"Failed to open table '{preferred_table}': {primary_err}. Trying fallback table '{fallback_table}'."
+                            )
+                            t1 = time.perf_counter()
+                            try:
+                                from .lancedb_client import get_db_connection
+                                db = get_db_connection()
+                                self._vector_store = LanceDBVectorStore(db=db, table_name=fallback_table)  # type: ignore[arg-type]
+                                self.logger.info(f"[QE] Step 3: Fallback vector store opened via shared connection (took {(time.perf_counter()-t1):.2f}s)")
+                            except TypeError:
+                                self._vector_store = LanceDBVectorStore(
+                                    uri=DB_PATH, table_name=fallback_table, mode="r"
+                                )
+                                self.logger.info(f"[QE] Step 3: Fallback vector store opened via URI (took {(time.perf_counter()-t1):.2f}s)")
+                        else:
+                            raise
         return self._vector_store
     
     def _get_index(self):
-        """Get or create the index (singleton per process)."""
+        """Get or create the index (singleton per process).
+
+        We build the index directly from the existing LanceDB vector store to
+        avoid dependency on a separate persisted `li_storage` directory. This
+        matches how embeddings are written by the DocumentProcessor.
+        """
         if self._index is None:
             with self._lock:
                 if self._index is None:
+                    self.logger.info("[QE] Step 4: Building VectorStoreIndex from LanceDB vector store ...")
+                    t0 = time.perf_counter()
                     vector_store = self._get_vector_store()
-                    storage_context = StorageContext.from_defaults(
-                        persist_dir=os.path.join(DB_PATH, "li_storage"),
-                        vector_store=vector_store,
-                    )
-                    self._index = load_index_from_storage(
-                        storage_context, 
-                        embed_model=self._get_embed_model()
-                    )
+                    self.logger.info("[QE] Step 4.1: Creating StorageContext ...")
+                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                    self.logger.info("[QE] Step 4.2: Constructing VectorStoreIndex.from_vector_store ...")
+                    try:
+                        self._index = VectorStoreIndex.from_vector_store(
+                            vector_store=vector_store,
+                            embed_model=self._get_embed_model(),
+                            storage_context=storage_context,
+                        )
+                    except Exception as e:
+                        self.logger.error(f"[QE] Step 4 ERROR: Failed to construct VectorStoreIndex: {e}", exc_info=True)
+                        raise
+                    self.logger.info(f"[QE] Step 4: Index ready (took {(time.perf_counter()-t0):.2f}s)")
         return self._index
     
     def _create_user_security_filters(self, user_id: str, group_ids: List[str]):
@@ -203,47 +273,79 @@ class QueryEngineFactory:
 
         Accepts either a pre-built `user_filters` or a `user_id` with `group_ids`.
         """
+        self._log_configuration()
+        self.logger.info("[QE] Creating query engine (building components)...")
         # Get the shared components
         embed_model = self._get_embed_model()
         llm = self._get_llm()
         index = self._get_index()
         
         # Create a new retriever instance (not shared)
+        self.logger.info("[QE] Step 5: Creating retriever ...")
+        t0 = time.perf_counter()
         retriever = VectorIndexRetriever(
             index=index,
             similarity_top_k=BEAM_K,
             search_type="similarity",
         )
+        self.logger.info(f"[QE] Step 5: Retriever ready (took {(time.perf_counter()-t0):.2f}s)")
         
         # Build filters if user_id/group_ids provided
         if user_filters is None and user_id is not None:
             try:
+                self.logger.info("[QE] Step 6: Building user security filters ...")
                 user_filters = self._create_user_security_filters(user_id, group_ids or [])
             except Exception as e:
                 self.logger.error(f"Failed to build user filters: {e}")
 
         # Apply filters if available
         if user_filters is not None:
+            self.logger.info("[QE] Step 6: Applying user filters to retriever")
             retriever.vector_store_kwargs = {"filters": user_filters}
         
-        # Create reranker - use GPU if available
-        reranker = SentenceTransformerRerank(
-            model="cross-encoder/ms-marco-MiniLM-L-6-v2", 
-            top_n=FINAL_K,
-            device=device,
-        )
+        # Create reranker optionally - default disabled to avoid cold-download stalls
+        reranker = None
+        if RERANK_ENABLED:
+            try:
+                # Prefer a local path if present; otherwise fall back to repo name
+                model_to_load = RERANK_MODEL_PATH if os.path.exists(RERANK_MODEL_PATH) else RERANK_MODEL_REPO
+                self.logger.info(f"[QE] Step 7: Initializing sentence transformer reranker (device=cuda if available, model={model_to_load}) ...")
+                t0 = time.perf_counter()
+                reranker = SentenceTransformerRerank(
+                    model=model_to_load,
+                    top_n=FINAL_K,
+                    device="cuda" if has_cuda else "cpu",
+                )
+                self.logger.info(f"[QE] Step 7: Reranker ready (took {(time.perf_counter()-t0):.2f}s)")
+            except Exception as rerank_err:
+                self.logger.warning(f"[QE] Step 7: Failed to initialize reranker: {rerank_err}. Proceeding without reranker.")
+        else:
+            self.logger.info("[QE] Step 7: Reranker disabled (ENABLE_RERANKER not set). Proceeding without reranker.")
         
         # Create response synthesizer
+        self.logger.info("[QE] Step 8: Creating response synthesizer ...")
+        t0 = time.perf_counter()
         response_synthesizer = get_response_synthesizer(
             llm=llm,
             text_qa_template=PromptTemplate(QA_TEMPLATE),
         )
+        self.logger.info(f"[QE] Step 8: Response synthesizer ready (took {(time.perf_counter()-t0):.2f}s)")
         
-        return RetrieverQueryEngine(
+        self.logger.info("[QE] Step 9: Finalizing query engine ...")
+        t0 = time.perf_counter()
+        engine = RetrieverQueryEngine(
             retriever=retriever,
-            node_postprocessors=[reranker],
+            node_postprocessors=[reranker] if reranker is not None else [],
             response_synthesizer=response_synthesizer,
         )
+        self.logger.info(f"[QE] Step 9: Query engine initialized successfully (took {(time.perf_counter()-t0):.2f}s)")
+        return engine
+
+    def query(self, query_text: str, user_id: str, group_ids: List[str], user_filters: Optional[MetadataFilters] = None):
+        """Convenience method: create an engine and execute a single query."""
+        self.logger.info("[QE] Executing single query via factory.create_query_engine -> engine.query()")
+        engine = self.create_query_engine(user_filters=user_filters, user_id=user_id, group_ids=group_ids)
+        return engine.query(query_text)
 
     # -----------------------------------------------------------------------
     # Simple query result cache helpers
@@ -488,4 +590,4 @@ def create_user_filters(user_id: str, group_ids: List[str]) -> MetadataFilters:
 
 # Global instances
 query_engine_factory = QueryEngineFactory()
-query_service = QueryEngineService()
+#query_service = QueryEngineService()
