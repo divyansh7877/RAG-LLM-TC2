@@ -16,6 +16,7 @@ from ..shared.models import JobStatus, Query
 from ..shared.config import config
 from ..shared.job_manager import job_manager
 from ..shared.query_engine_factory import query_engine_factory
+from ..shared.job_notifications import job_notification_service
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -521,6 +522,12 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         
         # Update job status to completed (this will trigger WebSocket notification)
         job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
+        # Broadcast query result for immediate UI update
+        try:
+            import asyncio
+            asyncio.run(job_notification_service.broadcast_query_result(user_id, query_id, result))
+        except Exception:
+            pass
         
         # Update query record with result
         query_data = redis_client.get_json(f"query:{query_id}")

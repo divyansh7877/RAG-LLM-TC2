@@ -84,7 +84,7 @@ start_worker() {
 start_worker "embedding_worker" "embedding" 1
 
 # Start query workers
-start_worker "query_worker" "query" 1
+# start_worker "query_worker" "query" 1
 
 # Start maintenance worker (single worker for cleanup tasks)
 start_worker "maintenance_worker" "maintenance" 1

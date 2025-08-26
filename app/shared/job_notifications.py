@@ -322,6 +322,29 @@ class JobNotificationService:
         except Exception as e:
             logger.error(f"Error broadcasting custom notification to user {user_id}: {e}")
     
+    async def broadcast_query_result(self, user_id: str, query_id: str, result: Dict[str, Any]):
+        """Broadcast a query result payload to the user for real-time UI update."""
+        try:
+            payload = {
+                "type": "query_result",
+                "data": {
+                    "query_id": query_id,
+                    "status": "completed",
+                    # For current frontend, `result` is expected as a string to display
+                    "result": result.get("answer") or "",
+                    # Provide full fields for richer clients
+                    "answer": result.get("answer"),
+                    "sources": result.get("sources", []),
+                    "result_count": result.get("result_count", 0),
+                    "cached": result.get("cached", False),
+                    "processing_time": result.get("processing_time"),
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+            await self._broadcast_job_notification(user_id, payload)
+        except Exception as e:
+            logger.error(f"Error broadcasting query result for user {user_id}, query {query_id}: {e}")
+    
     def get_notification_stats(self) -> Dict[str, Any]:
         """
         Get notification service statistics.
