@@ -47,7 +47,7 @@ has_cuda = getattr(config, "HAS_CUDA")
 device = "cuda" if has_cuda else "cpu"  
 EMBEDDING_DEVICE = device
 BEAM_K = 30      # initial ANN beam for MMR
-FINAL_K = 8     # chunks passed to the LLM
+FINAL_K = 4     # chunks passed to the LLM
 MMR_LAMBDA = 0.1
 RERANK_MODEL_REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
 RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", "./models/cross-encoder/ms-marco-MiniLM-L6-v2")
@@ -56,7 +56,7 @@ N_THREADS = mp.cpu_count()
 # Optimize for limited GPU memory (3.6 GB)
 # Use partial GPU layers to fit within memory constraints
 N_GPU_LAYERS = -1 if has_cuda else 0  # Use 20 layers on GPU, rest on CPU
-N_BATCH = 64 if has_cuda else 16     # Smaller batch size for limited VRAM
+N_BATCH = 256 if has_cuda else 64     # Smaller batch size for limited VRAM
 
 # ---------------------------------------------------------------------------
 # Prompt enforcing source citations
@@ -142,7 +142,7 @@ class QueryEngineFactory:
                     self._llm = LlamaCPP(
                         model_path=GGUF_MODEL_PATH,
                         temperature=0.3,
-                        max_new_tokens=512,
+                        max_new_tokens=256,
                         context_window=1024,
                         model_kwargs={
                             "n_batch": N_BATCH,

@@ -7,6 +7,7 @@ class RAGApp {
         this.apiBase = '/api';
         this.keycloak = null;
         this.user = null;
+        this.activeQueryId = null;
         this.websocket = null;
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
@@ -228,14 +229,99 @@ class RAGApp {
             });
 
             this.showToast('success', 'Query Submitted', `Query submitted successfully. You will be notified upon completion.`);
-            if (submitBtn) submitBtn.disabled = false;
             if (queryInput) queryInput.value = '';
+
+            // Start polling for query status/result as a fallback if WebSocket updates are unavailable
+            if (result && result.query_id) {
+                this.activeQueryId = result.query_id;
+                this.pollQueryUntilDone(result.query_id).catch(() => {});
+            }
+
+            if (submitBtn) submitBtn.disabled = false;
 
         } catch (error) {
             console.error('Query error:', error);
             if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${error.message}</div>`;
             if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
             if (submitBtn) submitBtn.disabled = false;
+        }
+    }
+
+    async pollQueryUntilDone(queryId) {
+        const queryStatus = document.getElementById('queryStatus');
+        const pollDelayMs = 2000;
+
+        // Poll status until completed/failed, then fetch final result
+        // Break early if a different query becomes active
+        /* eslint-disable no-constant-condition */
+        while (true) {
+            try {
+                // Stop polling if user submitted another query
+                if (this.activeQueryId && this.activeQueryId !== queryId) return;
+
+                const statusResp = await this.apiFetch(`${this.apiBase}/query/${queryId}/status`);
+                const status = statusResp?.status || 'pending';
+                const progress = Math.round((statusResp?.progress || 0) * 100);
+
+                if (queryStatus) {
+                    if (status === 'processing') {
+                        queryStatus.innerHTML = `<i class="fas fa-clock"></i> Status: Processing${Number.isFinite(progress) ? ` (${progress}%)` : ''}`;
+                    } else {
+                        queryStatus.innerHTML = `<i class="fas fa-clock"></i> Status: ${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+                    }
+                }
+
+                if (status === 'completed') {
+                    await this.loadQueryResult(queryId);
+                    return;
+                }
+                if (status === 'failed') {
+                    const queryResponse = document.getElementById('queryResponse');
+                    if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${statusResp?.error || 'Unknown error'}</div>`;
+                    if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
+                    return;
+                }
+            } catch (_) {
+                // Ignore transient errors and continue polling
+            }
+
+            await new Promise(r => setTimeout(r, pollDelayMs));
+        }
+    }
+
+    async loadQueryResult(queryId) {
+        try {
+            const data = await this.apiFetch(`${this.apiBase}/query/${queryId}`);
+            const queryResponse = document.getElementById('queryResponse');
+            const queryStatus = document.getElementById('queryStatus');
+
+            const answer = data?.answer || data?.result || '';
+            const sources = Array.isArray(data?.sources) ? data.sources : [];
+
+            if (queryResponse) {
+                // Preserve formatting in answer; backend may include basic markup
+                queryResponse.innerHTML = answer || 'No results found';
+
+                // Optionally append sources if available
+                if (sources.length > 0) {
+                    const sourcesHtml = sources
+                        .map(src => {
+                            if (typeof src === 'string') return `<li>${src}</li>`;
+                            const doc = src.document || src.document_name || 'Unknown Document';
+                            const page = src.page || src.page_number || 'Unknown';
+                            return `<li>Source: ${doc}, Page: ${page}</li>`;
+                        })
+                        .join('');
+                    queryResponse.innerHTML += `<div class="query-sources"><strong>Sources</strong><ul>${sourcesHtml}</ul></div>`;
+                }
+            }
+
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
+        } catch (error) {
+            const queryResponse = document.getElementById('queryResponse');
+            const queryStatus = document.getElementById('queryStatus');
+            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Failed to load query result: ${error.message}</div>`;
+            if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
         }
     }
 
