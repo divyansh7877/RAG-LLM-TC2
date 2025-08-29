@@ -265,3 +265,23 @@ class JobResponse(BaseModel):
 class ErrorResponse(BaseModel):
     """Error response model."""
     error: Dict[str, Any]
+
+
+class UserSession(RedisSerializable):
+    """User session model with Redis serialization support."""
+    session_id: str = Field(..., description="Unique session identifier")
+    user_id: str = Field(..., description="User identifier for the session")
+    groups: List[str] = Field(default_factory=list, description="Groups the user belongs to")
+    permissions: List[str] = Field(default_factory=list, description="Permissions granted to the session")
+    created_at: datetime = Field(default_factory=datetime.now, description="Session creation timestamp")
+    last_activity: datetime = Field(default_factory=datetime.now, description="Last activity timestamp")
+    is_active: bool = Field(default=True, description="Whether the session is currently active")
+
+    def update_activity(self):
+        """Update the last activity timestamp to now."""
+        self.last_activity = datetime.now()
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }

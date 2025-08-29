@@ -50,7 +50,7 @@ start_worker() {
     # fork-unsafe libs (PyTorch/CUDA, LanceDB/Arrow). This prevents hangs.
     local pool_arg=""
     if [ "${worker_name}" = "embedding_worker" ]; then
-        pool_arg="--pool=threads"
+        pool_arg="--pool=solo"
     elif [ "${worker_name}" = "query_worker" ]; then
         pool_arg="--pool=solo"
     fi
@@ -81,7 +81,7 @@ start_worker() {
 }
 
 # Start embedding workers (limited concurrency due to memory usage)
-#start_worker "embedding_worker" "embedding" 1
+start_worker "embedding_worker" "embedding" 1
 
 # Start query workers
 start_worker "query_worker" "query" 1

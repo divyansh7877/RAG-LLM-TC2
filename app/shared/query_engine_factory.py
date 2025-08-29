@@ -590,4 +590,4 @@ def create_user_filters(user_id: str, group_ids: List[str]) -> MetadataFilters:
 
 # Global instances
 query_engine_factory = QueryEngineFactory()
-#query_service = QueryEngineService()
+query_service = QueryEngineService()

@@ -59,9 +59,9 @@ def cleanup_expired_sessions():
         # Clean up temporary upload files older than 1 hour
         temp_dir = "./temp_uploads"
         cleaned_files = 0
+        current_time = time.time()
         
         if os.path.exists(temp_dir):
-            current_time = time.time()
             for filename in os.listdir(temp_dir):
                 file_path = os.path.join(temp_dir, filename)
                 if os.path.isfile(file_path):

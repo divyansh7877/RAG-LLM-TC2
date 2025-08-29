@@ -431,7 +431,7 @@ class SessionManager:
         
         try:
             # Test Redis connection
-            redis_health = redis_client.health_check()
+            redis_health = redis_client.detailed_health_check()
             health["redis_connection"] = redis_health.get("redis_sessions", False)
             
             if redis_health.get("errors"):

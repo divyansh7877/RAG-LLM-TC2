@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List, Set
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from .config import config
-from .models import Job, Document, Query
+from .models import Job, Document, Query, UserSession
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -77,6 +77,174 @@ class RedisClient:
         except Exception as e:
             logger.error(f"Redis operation error: {e}")
             raise
+
+    # ------------------------------
+    # Session management methods
+    # ------------------------------
+    def _session_key(self, session_id: str) -> str:
+        """Build the Redis key for a session object."""
+        return f"session:{session_id}"
+
+    def _user_sessions_key(self, user_id: str) -> str:
+        """Build the Redis key for the user's session ID set."""
+        return f"user_sessions:{user_id}"
+
+    def set_session(self, session: UserSession) -> bool:
+        """Create or update a session in the session DB with TTL and index by user."""
+        try:
+            expire_seconds = int(config.SESSION_EXPIRE_HOURS) * 3600
+            with self.get_connection(use_session_db=True) as client:
+                # Store the session JSON with TTL
+                ok = bool(client.set(self._session_key(session.session_id), session.to_redis(), ex=expire_seconds))
+                if ok:
+                    # Maintain a set of session IDs per user for efficient lookup
+                    client.sadd(self._user_sessions_key(session.user_id), session.session_id)
+                    # Ensure the index set also expires eventually (same window)
+                    client.expire(self._user_sessions_key(session.user_id), expire_seconds)
+                return ok
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Session SET error for session '{getattr(session, 'session_id', 'unknown')}': {e}")
+            return False
+
+    def get_session(self, session_id: str) -> Optional[UserSession]:
+        """Retrieve a session by ID from the session DB."""
+        try:
+            with self.get_connection(use_session_db=True) as client:
+                raw = client.get(self._session_key(session_id))
+                if not raw:
+                    return None
+                return UserSession.from_redis(raw)
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Session GET error for session '{session_id}': {e}")
+            return None
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session by ID and remove from the user index set if possible."""
+        try:
+            with self.get_connection(use_session_db=True) as client:
+                # Attempt to fetch to know the user_id for index cleanup
+                raw = client.get(self._session_key(session_id))
+                user_id: Optional[str] = None
+                try:
+                    if raw:
+                        user_id = UserSession.from_redis(raw).user_id
+                except Exception:
+                    user_id = None
+
+                deleted = bool(client.delete(self._session_key(session_id)))
+                if deleted and user_id:
+                    client.srem(self._user_sessions_key(user_id), session_id)
+                return deleted
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Session DELETE error for session '{session_id}': {e}")
+            return False
+
+    def get_user_sessions(self, user_id: str) -> List[UserSession]:
+        """Return all sessions for a given user from the session DB."""
+        try:
+            with self.get_connection(use_session_db=True) as client:
+                sessions: List[UserSession] = []
+                session_ids = list(client.smembers(self._user_sessions_key(user_id)) or [])
+
+                if session_ids:
+                    pipeline = client.pipeline()
+                    for session_id in session_ids:
+                        pipeline.get(self._session_key(session_id))
+                    results = pipeline.execute()
+                    for raw in results:
+                        if not raw:
+                            continue
+                        try:
+                            session = UserSession.from_redis(raw)
+                            if session.user_id == user_id:
+                                sessions.append(session)
+                        except Exception as parse_error:
+                            logger.warning(f"Failed to parse session for user '{user_id}': {parse_error}")
+                else:
+                    # Fallback: scan all sessions
+                    for key in client.scan_iter(match="session:*"):
+                        try:
+                            raw = client.get(key)
+                            if not raw:
+                                continue
+                            session = UserSession.from_redis(raw)
+                            if session.user_id == user_id:
+                                sessions.append(session)
+                        except Exception as parse_error:
+                            logger.warning(f"Failed to parse session key '{key}': {parse_error}")
+                return sessions
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Get user sessions error for user '{user_id}': {e}")
+            return []
+
+    def get_all_active_sessions(self) -> List[UserSession]:
+        """Return all active, non-expired sessions from the session DB."""
+        try:
+            with self.get_connection(use_session_db=True) as client:
+                sessions: List[UserSession] = []
+                expire_hours = int(config.SESSION_EXPIRE_HOURS)
+                for key in client.scan_iter(match="session:*"):
+                    try:
+                        raw = client.get(key)
+                        if not raw:
+                            continue
+                        session = UserSession.from_redis(raw)
+                        # Check active flag and expiration window
+                        if not session.is_active:
+                            continue
+                        expire_time = session.last_activity + timedelta(hours=expire_hours)
+                        if datetime.now() <= expire_time:
+                            sessions.append(session)
+                    except Exception as parse_error:
+                        logger.warning(f"Failed to parse session key '{key}': {parse_error}")
+                        continue
+                return sessions
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Get all active sessions error: {e}")
+            return []
+
+    def cleanup_expired_sessions(self) -> int:
+        """Remove sessions that are inactive or past the expiration window. Returns count removed."""
+        try:
+            cleaned = 0
+            expire_hours = int(config.SESSION_EXPIRE_HOURS)
+            with self.get_connection(use_session_db=True) as client:
+                for key in client.scan_iter(match="session:*"):
+                    try:
+                        raw = client.get(key)
+                        if not raw:
+                            # Already gone
+                            continue
+                        session = UserSession.from_redis(raw)
+                        should_delete = (not session.is_active)
+                        if not should_delete:
+                            expire_time = session.last_activity + timedelta(hours=expire_hours)
+                            if datetime.now() > expire_time:
+                                should_delete = True
+                        if should_delete:
+                            if client.delete(key):
+                                cleaned += 1
+                                # Clean user index set
+                                client.srem(self._user_sessions_key(session.user_id), session.session_id)
+                    except Exception as parse_error:
+                        logger.warning(f"Error cleaning session key '{key}': {parse_error}")
+                        continue
+            return cleaned
+        except RedisConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Cleanup expired sessions error: {e}")
+            return 0
     
     def get(self, key: str) -> Optional[str]:
         """Get value from Redis with proper error handling."""

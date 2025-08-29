@@ -50,7 +50,7 @@ class DocumentProcessor:
             self.device = device or ("cuda" if _config.HAS_CUDA else "cpu")
         except Exception:
             self.device = device or "cpu"
-        self.device="cpu"
+        # self.device="cpu"
         self.db = None
         self.vector_store = None
 
