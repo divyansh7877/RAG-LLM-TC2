@@ -36,6 +36,7 @@ import torch
 
 from .config import config
 from .error_handling import StructuredLogger
+from .openai_config import get_openai_params, get_retrieval_config
 
 # --------------------------------------------------------------------------- 
 # Configuration
@@ -43,18 +44,21 @@ from .error_handling import StructuredLogger
 DB_PATH = getattr(config, "LANCEDB_PATH", "./multi_user_db.lance")
 TABLE_NAME = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
 EMBED_MODEL_NAME = getattr(config, "EMBEDDING_MODEL_PATH", "./models/gte-large-en-v1.5")
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4-32k-0613")
-
 has_cuda = getattr(config, "HAS_CUDA")
 
-# Runtime knobs / env overrides
+# Runtime knobs / env overrides for optimized usage
 device = "cuda" if has_cuda else "cpu"
 EMBEDDING_DEVICE = device
-SIM_TOP_K = int(os.getenv("SIM_TOP_K", "4"))        # lower K → fewer chunks → 1 LLM call
-FINAL_K   = int(os.getenv("FINAL_K", "4"))          # top_n passed onward (and to reranker)
-OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
-OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "0"))
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
+
+# Get OpenAI and retrieval config from centralized module
+try:
+    _retrieval_config = get_retrieval_config()
+    SIM_TOP_K = int(os.getenv("SIM_TOP_K", str(_retrieval_config["similarity_top_k"])))
+    FINAL_K = int(os.getenv("FINAL_K", str(_retrieval_config["final_k"])))
+except Exception:
+    # Fallback values if config module fails
+    SIM_TOP_K = int(os.getenv("SIM_TOP_K", "8"))
+    FINAL_K = int(os.getenv("FINAL_K", "5"))
 
 RERANK_MODEL_REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
 RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", "./models/cross-encoder/ms-marco-MiniLM-L6-v2")
@@ -64,21 +68,27 @@ N_THREADS = mp.cpu_count()
 # --------------------------------------------------------------------------- 
 # Prompt enforcing source citations
 # --------------------------------------------------------------------------- 
-QA_TEMPLATE = """You are an AI assistant specialised in answering questions from provided expert-call transcripts.
-Use the context but do not just provide the context; use the CONTEXT and the QUESTION to generate a meaningful answer.
-If the context lacks the answer, reply: "The provided context does not contain information to answer this question."
-When citing, follow this format:
-(Source: {document_name}, Page: {page_number}).
+# Optimized prompt template for better OpenAI responses
+QA_TEMPLATE = """You are an expert AI assistant that provides accurate, well-structured answers based on provided document context.
+
+INSTRUCTIONS:
+1. Analyze the provided context carefully and provide a comprehensive answer to the question
+2. Structure your response clearly with key points and explanations
+3. ALWAYS cite your sources using the format: (Source: {document_name}, Page: {page_number})
+4. If the context doesn't contain sufficient information, state this clearly and suggest what additional information might be needed
+5. Provide actionable insights when relevant
+6. Keep your response focused and avoid unnecessary repetition
 
 ------------------------
-CONTEXT:
+CONTEXT INFORMATION:
 {context_str}
 
 ------------------------
-QUESTION:
+USER QUESTION:
 {query_str}
+
 ------------------------
-ANSWER:
+EXPERT RESPONSE:
 """
 
 # --------------------------------------------------------------------------- 
@@ -110,14 +120,16 @@ class QueryEngineFactory:
             return
         self._config_logged = True
         try:
+            from .openai_config import get_openai_config
+            openai_config = get_openai_config()
             self.logger.info(
                 "[QE] Configuration: "
                 f"DB_PATH={os.path.abspath(DB_PATH)}, TABLE_NAME={TABLE_NAME}, "
-                f"EMBED_MODEL_NAME={EMBED_MODEL_NAME}, LLM_PROVIDER=OpenAI, OPENAI_MODEL_NAME={OPENAI_MODEL_NAME}, "
+                f"EMBED_MODEL_NAME={EMBED_MODEL_NAME}, LLM_PROVIDER=OpenAI, OPENAI_MODEL_NAME={openai_config.model_name}, "
                 f"CUDA={has_cuda}, device={device}, "
                 f"SIM_TOP_K={SIM_TOP_K}, FINAL_K={FINAL_K}, "
                 f"RERANK_ENABLED={RERANK_ENABLED}, RERANK_MODEL_PATH={RERANK_MODEL_PATH}, "
-                f"OPENAI_TIMEOUT_SEC={OPENAI_TIMEOUT_SEC}, OPENAI_MAX_RETRIES={OPENAI_MAX_RETRIES}"
+                f"OPENAI_TIMEOUT_SEC={openai_config.timeout_sec}, OPENAI_MAX_RETRIES={openai_config.max_retries}"
             )
         except Exception:
             pass
@@ -126,36 +138,40 @@ class QueryEngineFactory:
         if self._embed_model is None:
             with self._lock:
                 if self._embed_model is None:
-                    embed_device = EMBEDDING_DEVICE
+                    from .embedding_optimizer import get_embedding_model
+                    from .gpu_memory_manager import gpu_memory_manager
+                    
                     t0 = time.perf_counter()
-                    self.logger.info("[QE] Step 1: Initializing embedding model ...")
-                    self._embed_model = HuggingFaceEmbedding(
-                        model_name=EMBED_MODEL_NAME,
-                        device=embed_device,
-                        trust_remote_code=True,
-                    )
-                    self.logger.info(f"[QE] Step 1: Embedding model ready on device={embed_device} (took {(time.perf_counter()-t0):.2f}s)")
+                    self.logger.info("[QE] Step 1: Initializing optimized embedding model ...")
+                    
+                    # Use the optimized embedding model with GPU memory management
+                    embed_device = EMBEDDING_DEVICE
+                    
+                    # Check GPU availability for embedding model
+                    if embed_device == "cuda" and not gpu_memory_manager.can_allocate_for_embedding(16, 384):
+                        self.logger.warning("[QE] Insufficient GPU memory for embedding model, using CPU")
+                        embed_device = "cpu"
+                    
+                    self._embed_model = get_embedding_model(EMBED_MODEL_NAME, embed_device)
+                    self.logger.info(f"[QE] Step 1: Optimized embedding model ready on device={embed_device} (took {(time.perf_counter()-t0):.2f}s)")
         return self._embed_model
     
     def _get_llm(self):
         if self._llm is None:
             with self._lock:
                 if self._llm is None:
-                    self.logger.info(f"[QE] Step 2: Initializing OpenAI LLM ({OPENAI_MODEL_NAME}) ...")
+                    # Get centralized OpenAI configuration
+                    openai_params = get_openai_params()
+                    self.logger.info(f"[QE] Step 2: Initializing OpenAI LLM ({openai_params['model']}) ...")
+                    
                     t0 = time.perf_counter()
                     api_key = os.getenv("OPENAI_API_KEY")
                     if not api_key:
                         self.logger.error("OPENAI_API_KEY environment variable not set.")
                         raise ValueError("OPENAI_API_KEY must be set to use the OpenAI LLM.")
 
-                    # IMPORTANT: disable blind retries to avoid bursty 429 loops
-                    self._llm = OpenAI(
-                        model=OPENAI_MODEL_NAME,
-                        temperature=OPENAI_TEMPERATURE,
-                        max_tokens=256,
-                        timeout=OPENAI_TIMEOUT_SEC,
-                        max_retries=OPENAI_MAX_RETRIES,
-                    )
+                    # Use centralized OpenAI configuration
+                    self._llm = OpenAI(**openai_params)
                     self.logger.info(f"[QE] Step 2: LLM ready (took {(time.perf_counter()-t0):.2f}s)")
         return self._llm
     
@@ -292,15 +308,17 @@ class QueryEngineFactory:
         else:
             self.logger.info("[QE] Step 7: Reranker disabled (ENABLE_RERANKER not set). Proceeding without reranker.")
         
-        # Single-shot response synthesizer
-        self.logger.info("[QE] Step 8: Creating response synthesizer ...")
+        # Optimized response synthesizer for OpenAI
+        self.logger.info("[QE] Step 8: Creating optimized response synthesizer ...")
         t0 = time.perf_counter()
         response_synthesizer = get_response_synthesizer(
             llm=llm,
-            response_mode="compact",                # ← single-shot if context fits
+            response_mode="compact",                # Single-shot for efficiency
             text_qa_template=PromptTemplate(QA_TEMPLATE),
+            streaming=False,                        # Disable streaming for stability
+            use_async=False,                       # Sync mode for better error handling
         )
-        self.logger.info(f"[QE] Step 8: Response synthesizer ready (took {(time.perf_counter()-t0):.2f}s)")
+        self.logger.info(f"[QE] Step 8: Optimized response synthesizer ready (took {(time.perf_counter()-t0):.2f}s)")
         
         self.logger.info("[QE] Step 9: Finalizing query engine ...")
         t0 = time.perf_counter()

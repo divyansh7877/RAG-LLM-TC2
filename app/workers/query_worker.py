@@ -17,18 +17,20 @@ from ..shared.config import config
 from ..shared.job_manager import job_manager
 from ..shared.query_engine_factory import query_engine_factory
 from ..shared.job_notifications import job_notification_service
+from ..shared.openai_config import should_retry_error, estimate_cost
+from ..shared.openai_rate_limiter import get_rate_limiter, check_quota_available
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
+# Optimized constants for OpenAI integration
 DB_PATH = config.LANCEDB_PATH
 TABLE_NAME = "document_embeddings_v2"
 EMBED_MODEL_NAME = config.EMBEDDING_MODEL_PATH
-LLM_MODEL_PATH = "./models/Llama-3.2-3B-Instruct-IQ3_M.gguf"
-CACHE_EXPIRE_SECONDS = 3600  # 1 hour cache expiration
-SIMILARITY_THRESHOLD = 0.7
-MAX_RETRIEVED_NODES = 10
+CACHE_EXPIRE_SECONDS = 7200  # 2 hour cache expiration for better performance
+SIMILARITY_THRESHOLD = 0.65  # Slightly lower threshold for broader retrieval
+MAX_RETRIEVED_NODES = 12     # Increased for better context
+OPENAI_RATE_LIMIT_DELAY = 1.0  # Delay between requests to avoid rate limits
 
 # Performance monitoring constants
 PERFORMANCE_METRICS_KEY = "performance:query_metrics"
@@ -61,24 +63,32 @@ def validate_query_security(user_id: str, group_ids: List[str], query_text: str)
     if not query_text or not query_text.strip():
         raise QuerySecurityError("Query text cannot be empty")
     
-    # Check for potential injection attempts or suspicious patterns
+    # Enhanced security validation for OpenAI queries
     suspicious_patterns = [
         "user_id:",
-        "group_id:",
+        "group_id:", 
         "metadata:",
         "__",  # Double underscore might indicate internal field access
         "SELECT",
         "DROP",
-        "DELETE",
+        "DELETE", 
         "UPDATE",
-        "INSERT"
+        "INSERT",
+        # OpenAI-specific patterns to watch for
+        "ignore previous instructions",
+        "act as",
+        "pretend to be",
+        "system:",
+        "prompt:"
     ]
     
     query_lower = query_text.lower()
     for pattern in suspicious_patterns:
         if pattern.lower() in query_lower:
             logger.warning(f"Suspicious query pattern detected: {pattern} in query from user {user_id}")
-            # Don't raise error for now, just log - could be legitimate query
+            # For OpenAI, we're more cautious about prompt injection
+            if pattern.lower() in ["ignore previous instructions", "act as", "pretend to be", "system:", "prompt:"]:
+                raise QuerySecurityError(f"Potential prompt injection detected: {pattern}")
     
     # Check query length to prevent abuse
     if len(query_text) > 2000:
@@ -411,7 +421,7 @@ def get_query_performance_stats(days: int = 7) -> Dict[str, Any]:
 
 @celery_app.task(bind=True, name="process_user_query", 
                 autoretry_for=(ConnectionError, TimeoutError), 
-                retry_kwargs={'max_retries': 2, 'countdown': 30})
+                retry_kwargs={'max_retries': 3, 'countdown': 60})  # Increased for OpenAI reliability
 def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], query_text: str):
     """
     Process user query with comprehensive security isolation and performance optimization.
@@ -487,17 +497,74 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             group_ids=group_ids,
         )
         
-        # Process query
-        update_query_progress(query_id, 0.6, "Processing query...")
-        response = query_engine.query(query_text)
+        # Process query with OpenAI rate limiting and quota checking
+        update_query_progress(query_id, 0.6, "Checking OpenAI availability...")
+        
+        # Check if OpenAI quota is available
+        import asyncio
+        quota_available = asyncio.run(check_quota_available())
+        if not quota_available:
+            error_msg = "OpenAI quota exceeded. Please try again later or contact administrator."
+            logger.error(f"OpenAI quota exceeded for query {query_id}")
+            job_manager.fail_job(job_id, error_msg)
+            return {"error": error_msg, "job_id": job_id, "quota_exceeded": True}
+        
+        update_query_progress(query_id, 0.7, "Processing query with OpenAI...")
+        
+        try:
+            response = query_engine.query(query_text)
+        except Exception as openai_error:
+            # Handle OpenAI-specific errors using centralized logic
+            should_retry, delay = should_retry_error(openai_error)
+            
+            # Also check with rate limiter for more sophisticated error handling
+            rate_limiter = get_rate_limiter()
+            error_dict = {"error": {"message": str(openai_error), "type": "unknown"}}
+            try:
+                # Try to parse as JSON if it looks like an API error
+                import json
+                if "{" in str(openai_error) and "}" in str(openai_error):
+                    error_start = str(openai_error).find("{")
+                    error_end = str(openai_error).rfind("}") + 1
+                    error_json = str(openai_error)[error_start:error_end]
+                    error_dict = json.loads(error_json)
+            except:
+                pass
+            
+            should_retry_limiter, delay_limiter = rate_limiter.handle_rate_limit_error(error_dict)
+            
+            # Use the more conservative approach
+            final_should_retry = should_retry and should_retry_limiter
+            final_delay = max(delay, delay_limiter)
+            
+            if final_should_retry:
+                logger.warning(f"OpenAI API error for query {query_id}, retrying after {final_delay}s: {str(openai_error)}")
+                time.sleep(final_delay)
+                response = query_engine.query(query_text)
+            else:
+                logger.error(f"Non-retryable OpenAI API error for query {query_id}: {str(openai_error)}")
+                # Update job with specific error information
+                if "insufficient_quota" in str(openai_error).lower():
+                    error_msg = "OpenAI quota exceeded. Please check billing and try again later."
+                    job_manager.fail_job(job_id, error_msg)
+                    return {"error": error_msg, "job_id": job_id, "quota_exceeded": True}
+                raise
         
         # Extract results
-        update_query_progress(query_id, 0.9, "Extracting results...")
-        answer = str(response.response) if response.response else "No answer found."
+        update_query_progress(query_id, 0.9, "Extracting and formatting results...")
+        answer = str(response.response) if response.response else "I couldn't find a relevant answer in the available documents."
         sources = extract_source_info(response)
         processing_time = time.time() - start_time
         
-        # Prepare result
+        # Prepare optimized result with OpenAI metadata and cost estimation
+        try:
+            # Estimate cost based on token usage (if available)
+            prompt_tokens = getattr(response, 'prompt_tokens', 0)
+            completion_tokens = getattr(response, 'completion_tokens', 0)
+            estimated_cost = estimate_cost(prompt_tokens, completion_tokens) if prompt_tokens or completion_tokens else 0.0
+        except Exception:
+            estimated_cost = 0.0
+        
         result = {
             "answer": answer,
             "sources": sources,
@@ -507,7 +574,17 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             "query_metadata": {
                 "similarity_threshold": SIMILARITY_THRESHOLD,
                 "max_retrieved_nodes": MAX_RETRIEVED_NODES,
-                "user_groups": group_ids
+                "user_groups": group_ids,
+                "llm_provider": "openai",
+                "response_quality": "high" if len(sources) > 0 else "limited",
+                "context_length": len(query_text),
+                "estimated_cost_usd": round(estimated_cost, 4)
+            },
+            # Additional response quality indicators
+            "response_metadata": {
+                "has_citations": "(Source:" in answer,
+                "response_length": len(answer),
+                "confidence_score": min(1.0, len(sources) / 5.0)  # Rough confidence based on source count
             }
         }
         
