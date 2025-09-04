@@ -127,6 +127,11 @@ celery_app.conf.update(
             "task": "worker_health_report",
             "schedule": 200.0,  # Every 200 seconds
             "options": {"queue": "maintenance"}
+        },
+        "cleanup-stuck-jobs": {
+            "task": "cleanup_stuck_jobs",
+            "schedule": 1800.0,  # Every 30 minutes
+            "options": {"queue": "maintenance"}
         }
     },
 )

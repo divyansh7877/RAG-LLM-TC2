@@ -975,17 +975,43 @@ async def upload_documents(
                 )
         
         # Create embedding job
-        job = job_manager.create_job(
-            user_id=current_user.id,
-            job_type=JobType.EMBEDDING,
-            metadata={
-                "group_id": group_id,
-                "file_count": len(temp_files),
-                "filenames": [Path(f).name for f in temp_files],
-                "temp_dir": temp_dir,
-                "upload_source": "api"
-            }
-        )
+        try:
+            job = job_manager.create_job(
+                user_id=current_user.id,
+                job_type=JobType.EMBEDDING,
+                metadata={
+                    "group_id": group_id,
+                    "file_count": len(temp_files),
+                    "filenames": [Path(f).name for f in temp_files],
+                    "temp_dir": temp_dir,
+                    "upload_source": "api"
+                }
+            )
+        except Exception as job_error:
+            # Handle job creation failures with better error messages
+            error_msg = str(job_error)
+            logger.error(f"Failed to create job for user {current_user.id}: {error_msg}")
+            
+            # Check for specific error conditions and provide helpful messages
+            if "maximum concurrent jobs limit" in error_msg.lower():
+                # Get current active job count for user
+                active_jobs = job_manager.get_user_jobs(current_user.id, active_only=True)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail={
+                        "error": "Too many concurrent jobs",
+                        "message": f"You have {len(active_jobs)} active jobs running. Please wait for some jobs to complete before uploading more files.",
+                        "active_job_count": len(active_jobs),
+                        "max_allowed": 10,
+                        "suggestion": "You can check job status at /api/jobs or cancel stuck jobs if any."
+                    }
+                )
+            else:
+                # Generic job creation error
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to create processing job: {error_msg}"
+                )
         
         # Queue embedding task
         task = celery_app.send_task(
@@ -1380,6 +1406,173 @@ async def cancel_job(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Job cancellation service error"
+        )
+
+
+@app.get("/api/jobs/status/summary", tags=["Jobs"])
+async def get_job_status_summary(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get a summary of user's job status including limits and recommendations.
+    
+    Args:
+        current_user: Current authenticated user
+    
+    Returns:
+        dict: Job status summary with recommendations
+    """
+    try:
+        # Get user statistics
+        stats = job_manager.get_job_statistics(current_user.id)
+        active_jobs = job_manager.get_user_jobs(current_user.id, active_only=True)
+        
+        # Check for stuck jobs
+        from datetime import timedelta
+        now = datetime.now()
+        stuck_jobs = []
+        old_pending = []
+        
+        for job in active_jobs:
+            if job.status == JobStatus.PROCESSING and job.started_at:
+                duration = now - job.started_at
+                if duration > timedelta(hours=2):
+                    stuck_jobs.append({
+                        "job_id": job.job_id,
+                        "type": job.job_type.value,
+                        "duration_hours": duration.total_seconds() / 3600,
+                        "started_at": job.started_at.isoformat()
+                    })
+            elif job.status == JobStatus.PENDING:
+                age = now - job.created_at
+                if age > timedelta(hours=1):
+                    old_pending.append({
+                        "job_id": job.job_id,
+                        "type": job.job_type.value,
+                        "age_hours": age.total_seconds() / 3600,
+                        "created_at": job.created_at.isoformat()
+                    })
+        
+        # Generate recommendations
+        recommendations = []
+        if len(stuck_jobs) > 0:
+            recommendations.append({
+                "type": "warning",
+                "message": f"You have {len(stuck_jobs)} stuck processing jobs that may need to be cancelled.",
+                "action": "Consider cancelling stuck jobs using POST /api/jobs/{job_id}/cancel"
+            })
+        
+        if len(old_pending) > 0:
+            recommendations.append({
+                "type": "info", 
+                "message": f"You have {len(old_pending)} old pending jobs that may be stuck in queue.",
+                "action": "These jobs might start processing soon, or you can cancel them if not needed."
+            })
+        
+        if len(active_jobs) >= 8:  # Approaching limit
+            recommendations.append({
+                "type": "warning",
+                "message": f"You are approaching the maximum concurrent jobs limit ({len(active_jobs)}/10).",
+                "action": "Consider waiting for some jobs to complete before uploading more files."
+            })
+        
+        return {
+            "user_id": current_user.id,
+            "job_limits": {
+                "max_concurrent_jobs": 10,
+                "current_active_jobs": len(active_jobs),
+                "remaining_slots": max(0, 10 - len(active_jobs))
+            },
+            "job_statistics": stats,
+            "stuck_jobs": stuck_jobs,
+            "old_pending_jobs": old_pending,
+            "recommendations": recommendations,
+            "can_upload": len(active_jobs) < 10,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting job status summary for user {current_user.id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job status summary service error"
+        )
+
+
+@app.post("/api/jobs/cleanup/stuck", tags=["Jobs"])
+async def cleanup_stuck_jobs_for_user(
+    current_user: User = Depends(get_current_user),
+    rate_limit: None = Depends(rate_limiter.create_rate_limiter(3, 3600))  # 3 cleanups per hour
+):
+    """
+    Clean up stuck jobs for the current user.
+    
+    Args:
+        current_user: Current authenticated user
+        rate_limit: Rate limiting dependency
+    
+    Returns:
+        dict: Cleanup results
+    """
+    try:
+        from datetime import timedelta
+        
+        active_jobs = job_manager.get_user_jobs(current_user.id, active_only=True)
+        now = datetime.now()
+        cleaned_jobs = []
+        
+        # Clean up stuck processing jobs (> 2 hours)
+        for job in active_jobs:
+            if job.status == JobStatus.PROCESSING and job.started_at:
+                duration = now - job.started_at
+                if duration > timedelta(hours=2):
+                    success = job_manager.cancel_job(
+                        job.job_id,
+                        f"Cancelled by user cleanup - stuck for {duration}"
+                    )
+                    if success:
+                        cleaned_jobs.append({
+                            "job_id": job.job_id,
+                            "type": job.job_type.value,
+                            "reason": "stuck_processing",
+                            "duration_hours": duration.total_seconds() / 3600
+                        })
+        
+        # Clean up old pending jobs (> 1 hour)
+        for job in active_jobs:
+            if job.status == JobStatus.PENDING:
+                age = now - job.created_at
+                if age > timedelta(hours=1):
+                    success = job_manager.cancel_job(
+                        job.job_id,
+                        f"Cancelled by user cleanup - pending for {age}"
+                    )
+                    if success:
+                        cleaned_jobs.append({
+                            "job_id": job.job_id,
+                            "type": job.job_type.value,
+                            "reason": "old_pending",
+                            "age_hours": age.total_seconds() / 3600
+                        })
+        
+        message = f"Cleaned up {len(cleaned_jobs)} stuck jobs" if cleaned_jobs else "No stuck jobs found"
+        
+        logger.info(f"User {current_user.id} cleaned up {len(cleaned_jobs)} stuck jobs")
+        
+        return {
+            "message": message,
+            "cleaned_jobs_count": len(cleaned_jobs),
+            "cleaned_jobs": cleaned_jobs,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cleaning up stuck jobs for user {current_user.id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Job cleanup service error"
         )
 
 

@@ -19,6 +19,7 @@ cd "$SCRIPT_DIR"
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+# export OPENAI_API_KEY="your_openai_api_key_here" # TODO: Replace with your actual key
 
 # Verify celery is available
 if ! command -v celery >/dev/null 2>&1; then
@@ -50,7 +51,7 @@ start_worker() {
     # fork-unsafe libs (PyTorch/CUDA, LanceDB/Arrow). This prevents hangs.
     local pool_arg=""
     if [ "${worker_name}" = "embedding_worker" ]; then
-        pool_arg="--pool=solo"
+        pool_arg="--pool=threads"
     elif [ "${worker_name}" = "query_worker" ]; then
         pool_arg="--pool=solo"
     fi

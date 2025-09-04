@@ -181,3 +181,71 @@ def cleanup_query_cache():
     except Exception as e:
         logger.error(f"Failed to cleanup query cache: {e}", exc_info=True)
         raise
+
+
+@celery_app.task(name="cleanup_stuck_jobs")
+def cleanup_stuck_jobs():
+    """
+    Automatically clean up stuck jobs that have been running too long.
+    
+    Jobs are considered stuck if:
+    - Processing jobs running for more than 2 hours
+    - Pending jobs waiting for more than 1 hour
+    """
+    from ..shared.job_manager import job_manager
+    from ..shared.models import JobStatus
+    from datetime import datetime, timedelta
+    
+    try:
+        now = datetime.now()
+        cleaned_jobs = 0
+        
+        logger.info("Starting automatic stuck job cleanup")
+        
+        # Clean up stuck processing jobs (running > 2 hours)
+        processing_jobs = job_manager.get_jobs_by_status(JobStatus.PROCESSING)
+        for job in processing_jobs:
+            if job.started_at:
+                duration = now - job.started_at
+                if duration > timedelta(hours=2):
+                    logger.warning(f"Cancelling stuck processing job {job.job_id} for user {job.user_id} (running for {duration})")
+                    success = job_manager.cancel_job(
+                        job.job_id, 
+                        f"Automatically cancelled - stuck for {duration} (started at {job.started_at})"
+                    )
+                    if success:
+                        cleaned_jobs += 1
+        
+        # Clean up old pending jobs (pending > 1 hour)
+        pending_jobs = job_manager.get_jobs_by_status(JobStatus.PENDING)
+        for job in pending_jobs:
+            age = now - job.created_at
+            if age > timedelta(hours=1):
+                logger.warning(f"Cancelling old pending job {job.job_id} for user {job.user_id} (pending for {age})")
+                success = job_manager.cancel_job(
+                    job.job_id,
+                    f"Automatically cancelled - pending for {age} (created at {job.created_at})"
+                )
+                if success:
+                    cleaned_jobs += 1
+        
+        result = {
+            "cleaned_jobs": cleaned_jobs,
+            "timestamp": time.time(),
+            "status": "SUCCESS"
+        }
+        
+        if cleaned_jobs > 0:
+            logger.info(f"Automatic stuck job cleanup completed: cleaned {cleaned_jobs} jobs")
+        else:
+            logger.debug("Automatic stuck job cleanup completed: no stuck jobs found")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in automatic stuck job cleanup: {e}", exc_info=True)
+        return {
+            "status": "ERROR",
+            "error": str(e),
+            "timestamp": time.time()
+        }

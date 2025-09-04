@@ -20,6 +20,8 @@ from ..shared.document_processor import DocumentProcessor
 from ..shared.redis_client import redis_client
 from ..shared.models import Document as DocModel
 from ..shared.job_notifications import job_notification_service
+from ..shared.gpu_memory_manager import gpu_memory_manager
+from ..shared.embedding_optimizer import clear_embedding_model
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,12 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
     """
     logger.info(f"Embedding job {job_id} started for user '{user_id}'/'{group_id}'.")
     job_manager.update_job_status(job_id, JobStatus.PROCESSING)
+    
+    # Log initial GPU memory state
+    initial_memory = gpu_memory_manager.get_memory_info()
+    if initial_memory:
+        logger.info(f"Initial GPU memory usage: {initial_memory.utilization_percent:.1f}%")
+    
     try:
         # best-effort notify over websockets that job started
         import asyncio
@@ -46,17 +54,29 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         pass
 
     try:
+        # Clear any existing models and GPU cache to start fresh
+        clear_embedding_model()
+        gpu_memory_manager.clear_cache()
+        
         # Initialize the processor with configuration from the central config
         table_name = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
+        device = "cuda" if config.HAS_CUDA else "cpu"
         logger.info(
             f"Preparing DocumentProcessor with db_path={os.path.abspath(config.LANCEDB_PATH)}, "
-            f"table={table_name}, model={config.EMBEDDING_MODEL_PATH}, device={'cuda' if config.HAS_CUDA else 'cpu'}"
+            f"table={table_name}, model={config.EMBEDDING_MODEL_PATH}, device={device}"
         )
+        
+        # Check GPU memory before initializing processor
+        if device == "cuda":
+            memory_info = gpu_memory_manager.get_memory_info()
+            if memory_info:
+                logger.info(f"GPU memory before processor init: {memory_info.utilization_percent:.1f}%")
+        
         processor = DocumentProcessor(
             db_path=os.path.abspath(config.LANCEDB_PATH),
             table_name=table_name,
             embed_model_name=config.EMBEDDING_MODEL_PATH,
-            device="cuda" if config.HAS_CUDA else "cpu"
+            device=device
         )
 
         # Execute the processing task
@@ -68,13 +88,43 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         except Exception:
             pass
 
-        logger.info("Calling processor.process_documents ...")
-        result = processor.process_documents(
-            file_paths=file_paths,
-            user_id=user_id,
-            group_id=group_id
-        )
-        logger.info("processor.process_documents returned result")
+        logger.info("Calling processor.process_documents with GPU memory management...")
+        
+        try:
+            result = processor.process_documents(
+                file_paths=file_paths,
+                user_id=user_id,
+                group_id=group_id
+            )
+            logger.info("processor.process_documents returned result")
+            
+        except Exception as process_error:
+            # Check if it's a GPU memory issue
+            error_str = str(process_error).lower()
+            if "cuda out of memory" in error_str or "out of memory" in error_str:
+                logger.warning(f"GPU OOM detected during processing: {process_error}")
+                
+                # Clear everything and try CPU fallback
+                clear_embedding_model()
+                gpu_memory_manager.clear_cache()
+                
+                logger.info("Attempting CPU fallback for entire processing pipeline")
+                cpu_processor = DocumentProcessor(
+                    db_path=os.path.abspath(config.LANCEDB_PATH),
+                    table_name=table_name,
+                    embed_model_name=config.EMBEDDING_MODEL_PATH,
+                    device="cpu"
+                )
+                
+                result = cpu_processor.process_documents(
+                    file_paths=file_paths,
+                    user_id=user_id,
+                    group_id=group_id
+                )
+                logger.info("CPU fallback processing completed successfully")
+            else:
+                # Re-raise non-memory related errors
+                raise
 
         if result.success:
             logger.info(f"Embedding job {job_id} completed successfully.")
@@ -94,6 +144,11 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
                     logger.info(f"Stored metadata for {os.path.basename(file_path)}")
                 except Exception as e:
                     logger.error(f"Failed to store metadata for {os.path.basename(file_path)}: {e}")
+            # Log final GPU memory state
+            final_memory = gpu_memory_manager.get_memory_info()
+            if final_memory:
+                logger.info(f"Final GPU memory usage: {final_memory.utilization_percent:.1f}%")
+            
             # Cleanup temp upload dir
             try:
                 job = redis_client.get_job(job_id)
@@ -102,6 +157,11 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
                     shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
                 pass
+            
+            # Final GPU cleanup
+            clear_embedding_model()
+            gpu_memory_manager.clear_cache()
+            
             try:
                 import asyncio
                 asyncio.run(job_notification_service.broadcast_progress_update(job_id))
@@ -112,7 +172,20 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
             raise RuntimeError(result.error)
 
     except Exception as e:
-        logger.error(f"Embedding job {job_id} failed: {e}", exc_info=True)
+        error_str = str(e).lower()
+        is_gpu_oom = "cuda out of memory" in error_str or "out of memory" in error_str
+        
+        if is_gpu_oom:
+            logger.error(f"Embedding job {job_id} failed with GPU OOM: {e}", exc_info=True)
+        else:
+            logger.error(f"Embedding job {job_id} failed: {e}", exc_info=True)
+        
+        # Always cleanup GPU memory on failure
+        try:
+            clear_embedding_model()
+            gpu_memory_manager.clear_cache()
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to cleanup GPU memory: {cleanup_error}")
 
         # Determine if Celery will retry this task
         will_retry = False
@@ -125,11 +198,22 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
 
         if will_retry:
             # Do NOT mark as FAILED yet; keep job in processing and retain temp files for retry
-            job_manager.update_job_progress(job_id, 0.05, f"Retrying after error: {str(e)}")
+            if is_gpu_oom:
+                retry_message = f"GPU OOM detected, retrying with CPU fallback: {str(e)}"
+            else:
+                retry_message = f"Retrying after error: {str(e)}"
+            job_manager.update_job_progress(job_id, 0.05, retry_message)
         else:
             # Final failure: mark failed and cleanup temp upload directory
             job_manager.update_job_progress(job_id, 1.0)
-            job_manager.update_job_status(job_id, JobStatus.FAILED, error=str(e))
+            
+            if is_gpu_oom:
+                error_message = f"Processing failed due to insufficient GPU memory: {str(e)}"
+            else:
+                error_message = str(e)
+                
+            job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_message)
+            
             try:
                 job = redis_client.get_job(job_id)
                 temp_dir = job.metadata.get("temp_dir") if job and job.metadata else None
