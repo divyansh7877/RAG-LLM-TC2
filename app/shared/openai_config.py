@@ -45,7 +45,7 @@ class OpenAIModelConfig:
 MODEL_CONFIGS = {
     "gpt-4o-mini": OpenAIModelConfig(
         model_name="gpt-4o-mini",
-        max_tokens=1500,
+        max_tokens=8000,
         temperature=0.1,
         timeout_sec=90,
         max_retries=3,

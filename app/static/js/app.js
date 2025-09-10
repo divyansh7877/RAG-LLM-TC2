@@ -27,6 +27,16 @@ class RAGApp {
             'text/csv': '.csv'
         };
 
+        // Configure marked for markdown rendering
+        if (typeof marked !== 'undefined') {
+            marked.setOptions({
+                breaks: true,
+                gfm: true,
+                sanitize: false,
+                smartypants: true
+            });
+        }
+
         this.init();
     }
 
@@ -40,7 +50,7 @@ class RAGApp {
 
     setupKeycloak() {
         this.keycloak = new Keycloak({
-            url: 'http://localhost:8080/',
+            url: 'http://192.168.1.117:8080/',
             realm: 'rag_app',
             clientId: 'fastapi-client'
         });
@@ -299,16 +309,17 @@ class RAGApp {
             const sources = Array.isArray(data?.sources) ? data.sources : [];
 
             if (queryResponse) {
-                // Preserve formatting in answer; backend may include basic markup
-                queryResponse.innerHTML = answer || 'No results found';
+                // Render markdown content
+                const renderedAnswer = this.renderMarkdown(answer || 'No results found');
+                queryResponse.innerHTML = renderedAnswer;
 
                 // Optionally append sources if available
                 if (sources.length > 0) {
                     const sourcesHtml = sources
                         .map(src => {
-                            if (typeof src === 'string') return `<li>${src}</li>`;
-                            const doc = src.document || src.document_name || 'Unknown Document';
-                            const page = src.page || src.page_number || 'Unknown';
+                            if (typeof src === 'string') return `<li>${this.escapeHtml(src)}</li>`;
+                            const doc = this.escapeHtml(src.document || src.document_name || 'Unknown Document');
+                            const page = this.escapeHtml(String(src.page || src.page_number || 'Unknown'));
                             return `<li>Source: ${doc}, Page: ${page}</li>`;
                         })
                         .join('');
@@ -875,10 +886,13 @@ class RAGApp {
         const queryStatus = document.getElementById('queryStatus');
 
         if (data.status === 'completed') {
-            if (queryResponse) queryResponse.innerHTML = data.result || 'No results found';
+            if (queryResponse) {
+                const renderedResult = this.renderMarkdown(data.result || 'No results found');
+                queryResponse.innerHTML = renderedResult;
+            }
             if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-check-circle"></i> Status: Completed';
         } else if (data.status === 'failed') {
-            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${data.error || 'Unknown error'}</div>`;
+            if (queryResponse) queryResponse.innerHTML = `<div class="error-message">Query failed: ${this.escapeHtml(data.error || 'Unknown error')}</div>`;
             if (queryStatus) queryStatus.innerHTML = '<i class="fas fa-exclamation-circle"></i> Status: Failed';
         }
     }
@@ -1051,6 +1065,59 @@ class RAGApp {
             default:
                 return 'Document';
         }
+    }
+
+    /**
+     * Render markdown text to HTML
+     * @param {string} markdown - The markdown text to render
+     * @returns {string} - The rendered HTML
+     */
+    renderMarkdown(markdown) {
+        if (typeof marked === 'undefined') {
+            // Fallback: basic formatting if marked.js is not available
+            return this.basicMarkdownToHtml(markdown);
+        }
+        
+        try {
+            return marked.parse(markdown);
+        } catch (error) {
+            console.error('Markdown rendering error:', error);
+            return this.escapeHtml(markdown);
+        }
+    }
+
+    /**
+     * Basic markdown to HTML converter (fallback)
+     * @param {string} text - The markdown text
+     * @returns {string} - Basic HTML
+     */
+    basicMarkdownToHtml(text) {
+        return this.escapeHtml(text)
+            // Headers
+            .replace(/^### (.*$)/gm, '<h3>$1</h3>')
+            .replace(/^## (.*$)/gm, '<h2>$1</h2>')
+            .replace(/^# (.*$)/gm, '<h1>$1</h1>')
+            // Bold and italic
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*(.*?)\*/g, '<em>$1</em>')
+            // Lists
+            .replace(/^\s*\* (.*)$/gm, '<li>$1</li>')
+            .replace(/^\s*\d+\. (.*)$/gm, '<li>$1</li>')
+            // Line breaks
+            .replace(/\n/g, '<br>');
+    }
+
+    /**
+     * Escape HTML characters to prevent XSS
+     * @param {string} text - The text to escape
+     * @returns {string} - The escaped text
+     */
+    escapeHtml(text) {
+        if (typeof text !== 'string') return String(text || '');
+        
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
     }
 }
 
