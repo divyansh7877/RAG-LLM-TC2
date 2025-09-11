@@ -19,6 +19,7 @@ from ..shared.query_engine_factory import query_engine_factory
 from ..shared.job_notifications import job_notification_service
 from ..shared.openai_config import should_retry_error, estimate_cost
 from ..shared.openai_rate_limiter import get_rate_limiter, check_quota_available
+from ..shared.query_history_manager import query_history_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -478,6 +479,19 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             # Update job status to completed (this will trigger WebSocket notification)
             job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=cached_result)
             
+            # Store cached query response in persistent history
+            try:
+                query_history_manager.store_query_response(
+                    query_id=query_id,
+                    job_id=job_id,
+                    user_id=user_id,
+                    query_text=query_text,
+                    response_result=cached_result
+                )
+                logger.info(f"Cached query {query_id} stored in persistent history")
+            except Exception as history_error:
+                logger.warning(f"Failed to store cached query {query_id} in history: {history_error}")
+            
             # Update query record with cached result
             query_data = redis_client.get_json(f"query:{query_id}")
             if query_data:
@@ -599,6 +613,20 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         
         # Update job status to completed (this will trigger WebSocket notification)
         job_manager.update_job_status(job_id, JobStatus.COMPLETED, result=result)
+        
+        # Store query response in persistent history for later access
+        try:
+            query_history_manager.store_query_response(
+                query_id=query_id,
+                job_id=job_id,
+                user_id=user_id,
+                query_text=query_text,
+                response_result=result
+            )
+            logger.info(f"Query {query_id} stored in persistent history")
+        except Exception as history_error:
+            logger.warning(f"Failed to store query {query_id} in history: {history_error}")
+        
         # Broadcast query result for immediate UI update
         try:
             import asyncio
@@ -606,7 +634,7 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         except Exception:
             pass
         
-        # Update query record with result
+        # Update query record with result (keeping original expiration for compatibility)
         query_data = redis_client.get_json(f"query:{query_id}")
         if query_data:
             query_data["status"] = "completed"
