@@ -15,6 +15,10 @@ class RAGApp {
         this.selectedFiles = [];
         this.jobsRefreshIntervalId = null;
         this.jobsAutoRefreshDelay = 5000;
+        this.historyCurrentPage = 0;
+        this.historyPageSize = 20;
+        this.historyCurrentSearch = '';
+        this.historyHasMore = false;
 
         this.supportedFileTypes = {
             'application/pdf': '.pdf',
@@ -115,6 +119,34 @@ class RAGApp {
         const statusFilter = document.getElementById('statusFilter');
         if (groupFilter) groupFilter.addEventListener('change', this.loadDocuments.bind(this));
         if (statusFilter) statusFilter.addEventListener('change', this.loadDocuments.bind(this));
+        
+        // Query History event listeners
+        const refreshHistory = document.getElementById('refreshHistory');
+        if (refreshHistory) {
+            refreshHistory.addEventListener('click', this.loadQueryHistory.bind(this));
+        }
+        
+        const searchBtn = document.getElementById('searchBtn');
+        const historySearch = document.getElementById('historySearch');
+        if (searchBtn) {
+            searchBtn.addEventListener('click', this.searchQueryHistory.bind(this));
+        }
+        if (historySearch) {
+            historySearch.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    this.searchQueryHistory();
+                }
+            });
+        }
+        
+        const prevPageBtn = document.getElementById('prevPageBtn');
+        const nextPageBtn = document.getElementById('nextPageBtn');
+        if (prevPageBtn) {
+            prevPageBtn.addEventListener('click', () => this.changeHistoryPage(-1));
+        }
+        if (nextPageBtn) {
+            nextPageBtn.addEventListener('click', () => this.changeHistoryPage(1));
+        }
     }
 
     // ... (Keep all the other methods like setupFileUpload, handleFileSelection, etc., but update the API calls)
@@ -663,6 +695,9 @@ class RAGApp {
         } else if (tabName === 'jobs') {
             this.loadJobs();
             this.startJobsAutoRefresh();
+        } else if (tabName === 'history') {
+            this.loadQueryHistory();
+            this.stopJobsAutoRefresh();
         } else {
             this.stopJobsAutoRefresh();
         }
@@ -1118,6 +1153,243 @@ class RAGApp {
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Query History Methods
+    async loadQueryHistory(reset = true) {
+        if (reset) {
+            this.historyCurrentPage = 0;
+            this.historyCurrentSearch = '';
+        }
+
+        const historyLoading = document.getElementById('historyLoading');
+        const historyList = document.getElementById('historyList');
+        const historyEmpty = document.getElementById('historyEmpty');
+        const historyPagination = document.getElementById('historyPagination');
+
+        if (historyLoading) historyLoading.style.display = 'block';
+        if (historyList) historyList.innerHTML = '';
+        if (historyEmpty) historyEmpty.style.display = 'none';
+        if (historyPagination) historyPagination.style.display = 'none';
+
+        try {
+            // Load query statistics
+            await this.loadQueryStats();
+
+            // Load query history
+            const offset = this.historyCurrentPage * this.historyPageSize;
+            const result = await this.apiFetch(`${this.apiBase}/query-history/user?limit=${this.historyPageSize}&offset=${offset}`);
+            
+            if (historyLoading) historyLoading.style.display = 'none';
+
+            if (result.queries && result.queries.length > 0) {
+                this.displayQueryHistory(result.queries);
+                this.historyHasMore = result.pagination?.has_more || false;
+                this.updateHistoryPagination();
+            } else {
+                if (historyEmpty) historyEmpty.style.display = 'block';
+            }
+
+        } catch (error) {
+            console.error('Failed to load query history:', error);
+            if (historyLoading) historyLoading.style.display = 'none';
+            if (historyList) historyList.innerHTML = '<div class="error-message">Failed to load query history</div>';
+        }
+    }
+
+    async loadQueryStats() {
+        try {
+            const stats = await this.apiFetch(`${this.apiBase}/query-history/stats/summary`);
+            
+            const totalQueries = document.getElementById('totalQueries');
+            const avgProcessingTime = document.getElementById('avgProcessingTime');
+            const retentionDays = document.getElementById('retentionDays');
+
+            if (totalQueries) totalQueries.textContent = stats.total_queries || 0;
+            if (avgProcessingTime) avgProcessingTime.textContent = stats.avg_processing_time ? `${stats.avg_processing_time}s` : '0s';
+            if (retentionDays) retentionDays.textContent = stats.retention_days || 30;
+
+        } catch (error) {
+            console.error('Failed to load query stats:', error);
+        }
+    }
+
+    async searchQueryHistory() {
+        const searchInput = document.getElementById('historySearch');
+        const searchTerm = searchInput ? searchInput.value.trim() : '';
+        
+        if (!searchTerm) {
+            this.loadQueryHistory(true);
+            return;
+        }
+
+        const historyLoading = document.getElementById('historyLoading');
+        const historyList = document.getElementById('historyList');
+        const historyEmpty = document.getElementById('historyEmpty');
+        const historyPagination = document.getElementById('historyPagination');
+
+        if (historyLoading) historyLoading.style.display = 'block';
+        if (historyList) historyList.innerHTML = '';
+        if (historyEmpty) historyEmpty.style.display = 'none';
+        if (historyPagination) historyPagination.style.display = 'none';
+
+        try {
+            const result = await this.apiFetch(`${this.apiBase}/query-history/search?q=${encodeURIComponent(searchTerm)}&limit=20`);
+            
+            if (historyLoading) historyLoading.style.display = 'none';
+
+            if (result.matches && result.matches.length > 0) {
+                this.displayQueryHistory(result.matches);
+                this.historyCurrentSearch = searchTerm;
+            } else {
+                if (historyEmpty) historyEmpty.style.display = 'block';
+                if (historyList) historyList.innerHTML = '<div class="empty-state"><i class="fas fa-search"></i><h4>No Results Found</h4><p>No queries found matching your search.</p></div>';
+            }
+
+        } catch (error) {
+            console.error('Failed to search query history:', error);
+            if (historyLoading) historyLoading.style.display = 'none';
+            if (historyList) historyList.innerHTML = '<div class="error-message">Failed to search query history</div>';
+        }
+    }
+
+    changeHistoryPage(direction) {
+        const newPage = Math.max(0, this.historyCurrentPage + direction);
+        if (newPage === this.historyCurrentPage) return;
+        
+        this.historyCurrentPage = newPage;
+        this.loadQueryHistory(false);
+    }
+
+    updateHistoryPagination() {
+        const historyPagination = document.getElementById('historyPagination');
+        const prevPageBtn = document.getElementById('prevPageBtn');
+        const nextPageBtn = document.getElementById('nextPageBtn');
+        const pageInfo = document.getElementById('pageInfo');
+
+        if (historyPagination) historyPagination.style.display = 'flex';
+        if (prevPageBtn) prevPageBtn.disabled = this.historyCurrentPage === 0;
+        if (nextPageBtn) nextPageBtn.disabled = !this.historyHasMore;
+        if (pageInfo) pageInfo.textContent = `Page ${this.historyCurrentPage + 1}`;
+    }
+
+    displayQueryHistory(queries) {
+        const historyList = document.getElementById('historyList');
+        if (!historyList) return;
+
+        historyList.innerHTML = queries.map(query => {
+            const queryId = query.query_id;
+            const queryText = query.query_text || 'No query text';
+            const processingTime = query.processing_time ? `${query.processing_time.toFixed(2)}s` : 'N/A';
+            const createdAt = this.formatDate(query.created_at);
+            
+            return `
+                <div class="history-item" data-query-id="${queryId}">
+                    <div class="history-item-header">
+                        <div class="history-query-preview">${this.escapeHtml(queryText)}</div>
+                        <div class="history-meta">
+                            <div class="history-date">${createdAt}</div>
+                            <div class="history-time">${processingTime}</div>
+                        </div>
+                    </div>
+                    <div class="history-stats-row">
+                        <div class="history-stat-item">
+                            <i class="fas fa-clock"></i>
+                            ${processingTime}
+                        </div>
+                        <div class="history-stat-item">
+                            <i class="fas fa-calendar"></i>
+                            ${this.formatRelativeTime(query.created_at)}
+                        </div>
+                        <div class="history-stat-item">
+                            <i class="fas fa-link"></i>
+                            Job ID: ${query.job_id || 'N/A'}
+                        </div>
+                    </div>
+                    <div class="history-response" style="display: none;">
+                        <div class="loading">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            Loading full response...
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        // Add click handlers to expand/collapse history items
+        historyList.querySelectorAll('.history-item').forEach(item => {
+            item.addEventListener('click', () => {
+                this.toggleHistoryItem(item);
+            });
+        });
+    }
+
+    async toggleHistoryItem(historyItem) {
+        const queryId = historyItem.dataset.queryId;
+        const responseDiv = historyItem.querySelector('.history-response');
+        const isExpanded = historyItem.classList.contains('expanded');
+
+        if (isExpanded) {
+            // Collapse
+            historyItem.classList.remove('expanded');
+            responseDiv.style.display = 'none';
+            return;
+        }
+
+        // Expand
+        historyItem.classList.add('expanded');
+        responseDiv.style.display = 'block';
+
+        try {
+            const queryHistory = await this.apiFetch(`${this.apiBase}/query-history/${queryId}`);
+            const history = queryHistory.query_history;
+            
+            const responseText = history.response || 'No response available';
+            const sources = history.sources || [];
+            
+            responseDiv.innerHTML = `
+                <div class="history-response-text">
+                    ${this.renderMarkdown(responseText)}
+                </div>
+                ${sources.length > 0 ? `
+                    <div class="history-sources">
+                        <h5><i class="fas fa-book"></i> Sources (${sources.length})</h5>
+                        ${sources.map(source => `
+                            <span class="history-source">
+                                ${this.escapeHtml(source.document || 'Unknown')} 
+                                ${source.page ? `(Page ${source.page})` : ''}
+                            </span>
+                        `).join('')}
+                    </div>
+                ` : ''}
+            `;
+        } catch (error) {
+            console.error('Failed to load query details:', error);
+            responseDiv.innerHTML = '<div class="error-message">Failed to load query details</div>';
+        }
+    }
+
+    formatRelativeTime(dateString) {
+        try {
+            const date = new Date(dateString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+            const diffMinutes = Math.floor(diffMs / (1000 * 60));
+
+            if (diffDays > 0) {
+                return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+            } else if (diffHours > 0) {
+                return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+            } else if (diffMinutes > 0) {
+                return `${diffMinutes} minute${diffMinutes > 1 ? 's' : ''} ago`;
+            } else {
+                return 'Just now';
+            }
+        } catch (error) {
+            return 'Unknown';
+        }
     }
 }
 

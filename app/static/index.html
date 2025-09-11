@@ -59,6 +59,10 @@
                     <i class="fas fa-tasks"></i>
                     Job Status
                 </button>
+                <button class="nav-tab" data-tab="history">
+                    <i class="fas fa-history"></i>
+                    Query History
+                </button>
             </nav>
 
             <!-- Tab Content -->
@@ -197,6 +201,69 @@
                         <div id="jobsLoading" class="loading" style="display: none;">
                             <i class="fas fa-spinner fa-spin"></i>
                             Loading jobs...
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Query History Tab -->
+                <div id="historyTab" class="tab-pane">
+                    <div class="history-section">
+                        <div class="history-header">
+                            <h3>Query History</h3>
+                            <div class="history-controls">
+                                <div class="search-box">
+                                    <input type="text" id="historySearch" class="form-control" placeholder="Search queries...">
+                                    <button id="searchBtn" class="btn btn-secondary">
+                                        <i class="fas fa-search"></i>
+                                    </button>
+                                </div>
+                                <button id="refreshHistory" class="btn btn-secondary">
+                                    <i class="fas fa-sync-alt"></i>
+                                    Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="history-stats">
+                            <div class="history-stat">
+                                <div class="stat-value" id="totalQueries">0</div>
+                                <div class="stat-label">Total Queries</div>
+                            </div>
+                            <div class="history-stat">
+                                <div class="stat-value" id="avgProcessingTime">0s</div>
+                                <div class="stat-label">Avg Time</div>
+                            </div>
+                            <div class="history-stat">
+                                <div class="stat-value" id="retentionDays">30</div>
+                                <div class="stat-label">Retention Days</div>
+                            </div>
+                        </div>
+
+                        <div id="historyList" class="history-list">
+                            <!-- Query history items will be loaded here -->
+                        </div>
+
+                        <div id="historyPagination" class="pagination" style="display: none;">
+                            <button id="prevPageBtn" class="btn btn-secondary">
+                                <i class="fas fa-chevron-left"></i>
+                                Previous
+                            </button>
+                            <span id="pageInfo">Page 1</span>
+                            <button id="nextPageBtn" class="btn btn-secondary">
+                                Next
+                                <i class="fas fa-chevron-right"></i>
+                            </button>
+                        </div>
+
+                        <div id="historyLoading" class="loading" style="display: none;">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            Loading query history...
+                        </div>
+
+                        <div id="historyEmpty" class="empty-state" style="display: none;">
+                            <i class="fas fa-history"></i>
+                            <h4>No Query History</h4>
+                            <p>Your query history will appear here after you submit queries.</p>
                         </div>
                     </div>
                 </div>
