@@ -63,6 +63,10 @@ class Config:
     
     # Session settings
     SESSION_EXPIRE_HOURS = int(os.getenv("SESSION_EXPIRE_HOURS", "24"))
+    
+    # Query history settings
+    QUERY_HISTORY_RETENTION_DAYS = int(os.getenv("QUERY_HISTORY_RETENTION_DAYS", "30"))
+    MAX_QUERIES_PER_USER = int(os.getenv("MAX_QUERIES_PER_USER", "1000"))
 
     # Keycloak configuration
     KEYCLOAK_SERVER_URL = os.getenv("KEYCLOAK_SERVER_URL", "http://192.168.1.117:8080/")
