@@ -2108,6 +2108,9 @@ async def change_password(
 from ..shared.models import QueryRequest, QueryResponse, Query, JobStatus
 from ..workers.query_worker import process_user_query
 
+# Import and include query history endpoints
+from .query_history_endpoints import router as query_history_router
+
 
 @app.post("/api/query", tags=["Query"])
 async def submit_query(
@@ -2639,6 +2642,9 @@ async def get_query_cache_info(
             detail="Cache info service error"
         )
 
+
+# Include query history router
+app.include_router(query_history_router)
 
 # WebSocket endpoint for real-time updates
 from fastapi import WebSocket, WebSocketDisconnect
