@@ -245,12 +245,22 @@ class QueryEngineFactory:
         if not group_ids or len(group_ids) == 0:
             raise ValueError("At least one group ID is required")
         try:
+            # Log the filter creation for debugging data isolation issues
+            self.logger.info(f"Creating security filters for user_id='{user_id}', group_ids={group_ids}")
+            
             user_filter = ExactMatchFilter(key="user_id", value=user_id)
             group_filters = [ExactMatchFilter(key="group_id", value=group_id) for group_id in group_ids]
             all_filters = [user_filter] + group_filters
-            return MetadataFilters(filters=all_filters, condition="or")
+            
+            # Create the metadata filters with OR condition
+            # This means: user can access documents where (user_id matches) OR (group_id matches any of their groups)
+            filters = MetadataFilters(filters=all_filters, condition="or")
+            
+            self.logger.debug(f"Created security filters: {len(all_filters)} total filters (1 user + {len(group_filters)} groups)")
+            return filters
+            
         except Exception as e:
-            self.logger.error(f"Failed to create user security filters: {e}")
+            self.logger.error(f"Failed to create user security filters for user '{user_id}': {e}")
             raise ValueError(f"Failed to create security filters: {e}")
 
     def create_query_engine(
@@ -408,6 +418,19 @@ class QueryEngineFactory:
             }
             return stats
 
+    def invalidate_vector_store(self):
+        """Invalidate the vector store and index to force reload on next query.
+        This should be called when new documents are added to ensure fresh data retrieval.
+        """
+        with self._lock:
+            if self._vector_store is not None or self._index is not None:
+                self.logger.info("Invalidating vector store and index due to new document additions")
+                self._vector_store = None
+                self._index = None
+                # Clear query cache as well since results may be stale
+                self._query_cache.clear()
+                self.logger.info("Vector store, index, and query cache invalidated")
+    
     def cleanup(self):
         with self._lock:
             self._embed_model = None

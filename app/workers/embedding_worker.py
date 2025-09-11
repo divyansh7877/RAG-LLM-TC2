@@ -22,6 +22,7 @@ from ..shared.models import Document as DocModel
 from ..shared.job_notifications import job_notification_service
 from ..shared.gpu_memory_manager import gpu_memory_manager
 from ..shared.embedding_optimizer import clear_embedding_model
+from ..shared.query_engine_factory import query_engine_factory
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,14 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
                     shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
                 pass
+            
+            # Invalidate query engine vector store to ensure fresh data retrieval
+            # This fixes the bug where all queries were getting the same old documents
+            try:
+                query_engine_factory.invalidate_vector_store()
+                logger.info(f"Invalidated query engine vector store after processing job {job_id}")
+            except Exception as invalidation_error:
+                logger.warning(f"Failed to invalidate vector store for job {job_id}: {invalidation_error}")
             
             # Final GPU cleanup
             clear_embedding_model()
