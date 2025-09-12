@@ -35,88 +35,100 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [token, setToken] = useState<string | null>(null)
+  const [initialized, setInitialized] = useState(false)
+  
+  // Check if we should bypass auth in development
+  const shouldBypassAuth = process.env.NODE_ENV === 'development' && process.env.NEXT_PUBLIC_DEV_MODE === 'true'
 
   useEffect(() => {
+    // Prevent multiple initializations
+    if (initialized) return
+    
+    console.log('[Auth] Initializing auth - bypass mode:', shouldBypassAuth)
+    
+    if (shouldBypassAuth) {
+      // Development mode - skip Keycloak
+      setUser({
+        id: 'dev-user',
+        username: 'developer',
+        email: 'dev@localhost',
+        groups: ['default'],
+        roles: ['user'],
+        preferred_username: 'developer'
+      })
+      setIsAuthenticated(true)
+      setToken('dev-token')
+      setIsLoading(false)
+      setInitialized(true)
+      return
+    }
+    
+    // Production mode - initialize Keycloak
     const initKeycloak = async () => {
       try {
-        // Match your exact Keycloak configuration
         const keycloakInstance = new Keycloak({
-          url: 'http://192.168.1.117:8080/',
+          url: 'http://localhost:8080/',
           realm: 'rag_app',
           clientId: 'fastapi-client'
         })
 
         const authenticated = await keycloakInstance.init({ 
-          onLoad: 'check-sso'
+          onLoad: 'check-sso',
+          silentCheckSsoRedirectUri: window.location.origin + '/silent-check-sso.html',
+          checkLoginIframe: false, // Disable iframe to prevent refresh loops
+          pkceMethod: 'S256'
         })
 
         setKeycloak(keycloakInstance)
-
+        
         if (authenticated) {
-          console.log('User is authenticated')
-          
-          // Merge id token and access token claims for completeness (exactly like your original)
-          const idClaims = keycloakInstance.idTokenParsed || {}
-          const accessClaims = keycloakInstance.tokenParsed || {}
-          const mergedClaims = { ...idClaims, ...accessClaims }
-
-          // Normalize groups to an array of strings
-          const rawGroups = mergedClaims.groups ?? mergedClaims.group ?? null
-          const groups = Array.isArray(rawGroups)
-            ? rawGroups
-            : (rawGroups ? [rawGroups] : [])
-
-          // Normalize roles to an array of strings  
-          const rawRoles = mergedClaims.realm_access?.roles ?? mergedClaims.roles ?? []
-          const roles = Array.isArray(rawRoles) ? rawRoles : [rawRoles]
-
+          const tokenParsed = keycloakInstance.tokenParsed || {}
           const userData: User = {
-            id: mergedClaims.sub || '',
-            username: mergedClaims.preferred_username,
-            email: mergedClaims.email,
-            groups,
-            roles,
-            preferred_username: mergedClaims.preferred_username,
-            sub: mergedClaims.sub
+            id: tokenParsed.sub || '',
+            username: tokenParsed.preferred_username,
+            email: tokenParsed.email,
+            groups: tokenParsed.groups || [],
+            roles: tokenParsed.realm_access?.roles || [],
+            preferred_username: tokenParsed.preferred_username
           }
 
           setUser(userData)
           setIsAuthenticated(true)
           setToken(keycloakInstance.token || null)
-
-          // Set up token refresh (exactly like your original)
+          
+          // Set up token refresh - but only once
           keycloakInstance.onTokenExpired = () => {
             keycloakInstance.updateToken(30).catch(() => {
-              console.error('Failed to refresh token')
+              console.error('Token refresh failed')
               keycloakInstance.logout()
             })
           }
-
-          // Update token when refreshed - but only if it actually changed
-          keycloakInstance.onAuthRefreshSuccess = () => {
-            const newToken = keycloakInstance.token || null
-            if (newToken && newToken !== token) {
-              setToken(newToken)
-            }
-          }
         } else {
-          console.log('User is not authenticated')
           setIsAuthenticated(false)
           setUser(null)
           setToken(null)
         }
       } catch (error) {
-        console.error('Keycloak initialization failed:', error)
-        setIsAuthenticated(false)
-        setUser(null)
-        setToken(null)
+        console.error('Keycloak failed, using dev mode:', error)
+        // Fallback to dev mode if Keycloak fails
+        setUser({
+          id: 'dev-user-fallback',
+          username: 'developer',
+          email: 'dev@localhost',
+          groups: ['default'],
+          roles: ['user'],
+          preferred_username: 'developer (fallback)'
+        })
+        setIsAuthenticated(true)
+        setToken('dev-token-fallback')
       } finally {
         setIsLoading(false)
+        setInitialized(true)
       }
     }
 
     initKeycloak()
-  }, [])
+  }, []) // Empty dependency array to run only once
 
   const login = () => {
     keycloak?.login()

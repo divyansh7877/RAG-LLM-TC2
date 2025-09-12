@@ -12,14 +12,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
       new QueryClient({
         defaultOptions: {
           queries: {
-            staleTime: 1000 * 60 * 10, // 10 minutes
+            staleTime: 1000 * 60 * 5, // 5 minutes
             refetchOnWindowFocus: false,
-            refetchOnMount: true,
+            refetchOnMount: false, // Manual refetch only
             refetchOnReconnect: false,
-            refetchInterval: false, // Disable automatic refetching
-            retry: false, // Disable retries completely to prevent loops
-            networkMode: 'online', // Only run queries when online
-            gcTime: 1000 * 60 * 30, // 30 minutes garbage collection
+            refetchInterval: false, // No automatic refetching
+            retry: 1, // Only retry once
+            networkMode: 'online',
+            gcTime: 1000 * 60 * 30, // 30 minutes
           },
         },
       })

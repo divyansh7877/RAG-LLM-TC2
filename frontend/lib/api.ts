@@ -83,28 +83,9 @@ class ApiClient {
     options: RequestInit = {}
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
-    const cacheKey = `${options.method || 'GET'}:${url}:${JSON.stringify(options.body || '')}`;
     
-    // For GET requests, check if we have a pending request to avoid duplicates
-    if (!options.method || options.method === 'GET') {
-      if (this.requestCache.has(cacheKey)) {
-        return this.requestCache.get(cacheKey);
-      }
-    }
-    
-    const requestPromise = this.performRequest<T>(url, options);
-    
-    // Cache GET requests only
-    if (!options.method || options.method === 'GET') {
-      this.requestCache.set(cacheKey, requestPromise);
-      
-      // Clean up cache after request completes
-      requestPromise.finally(() => {
-        setTimeout(() => this.requestCache.delete(cacheKey), 1000);
-      });
-    }
-    
-    return requestPromise;
+    // Temporarily disable caching to prevent refresh loops
+    return this.performRequest<T>(url, options);
   }
 
   private async performRequest<T>(url: string, options: RequestInit): Promise<T> {

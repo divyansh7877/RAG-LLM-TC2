@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { AuthenticatedLayout } from '@/components/AuthenticatedLayout'
+import { DebugRefresh } from '@/components/DebugRefresh'
 
 const navigation = [
   { name: 'Upload', href: '/upload', icon: Upload, description: 'Upload and process documents' },
@@ -57,6 +58,7 @@ export default function HomePage() {
 
   return (
     <AuthenticatedLayout>
+      <DebugRefresh name="HomePage" />
       <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex justify-end mb-8">

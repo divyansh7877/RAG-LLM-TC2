@@ -17,6 +17,7 @@ export function AuthenticatedApiProvider({ children }: AuthenticatedApiProviderP
   useEffect(() => {
     // Only update the API client if the token actually changed
     if (lastTokenRef.current !== token) {
+      console.log('[API] Token changed, updating API client')
       lastTokenRef.current = token
       api.setAuthToken(token)
     }
