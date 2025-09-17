@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  reactStrictMode: false, // Temporarily disable to prevent double initialization
   typescript: {
     // !! WARN !!
     // Dangerously allow production builds to successfully complete even if

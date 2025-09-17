@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Clear Auth Storage</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        button {
+            background-color: #dc3545;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 10px;
+        }
+        button:hover {
+            background-color: #c82333;
+        }
+        .success {
+            color: green;
+            margin-top: 20px;
+        }
+        .storage-info {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        code {
+            background-color: #e9ecef;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Clear Keycloak Authentication Storage</h1>
+    
+    <p>Open this file in your browser at <code>http://localhost:3000</code> to clear authentication storage in the correct context.</p>
+    
+    <div class="storage-info">
+        <h3>Current Storage Keys:</h3>
+        <div id="storage-keys"></div>
+    </div>
+    
+    <button onclick="clearAll()">Clear All Auth Storage</button>
+    <button onclick="clearSessionOnly()">Clear Session Storage Only</button>
+    <button onclick="clearLocalOnly()">Clear Local Storage Only</button>
+    <button onclick="refreshKeys()">Refresh Keys</button>
+    
+    <div id="result"></div>
+    
+    <h3>Instructions:</h3>
+    <ol>
+        <li>Click "Clear All Auth Storage" to remove all Keycloak-related data</li>
+        <li>Close this tab</li>
+        <li>Open a new tab and navigate to <code>http://localhost:3000</code></li>
+        <li>Try logging in again</li>
+    </ol>
+
+    <script>
+        function displayKeys() {
+            const display = document.getElementById('storage-keys');
+            let html = '<h4>SessionStorage:</h4><ul>';
+            
+            // SessionStorage keys
+            const ssKeys = Object.keys(sessionStorage).filter(k => 
+                k.startsWith('kc-') || k.startsWith('oidc.') || k.includes('__KC')
+            );
+            
+            if (ssKeys.length === 0) {
+                html += '<li>No Keycloak keys found</li>';
+            } else {
+                ssKeys.forEach(key => {
+                    html += `<li><code>${key}</code></li>`;
+                });
+            }
+            html += '</ul>';
+            
+            // LocalStorage keys
+            html += '<h4>LocalStorage:</h4><ul>';
+            const lsKeys = Object.keys(localStorage).filter(k => 
+                k.startsWith('kc-') || k.startsWith('oidc.')
+            );
+            
+            if (lsKeys.length === 0) {
+                html += '<li>No Keycloak keys found</li>';
+            } else {
+                lsKeys.forEach(key => {
+                    html += `<li><code>${key}</code></li>`;
+                });
+            }
+            html += '</ul>';
+            
+            display.innerHTML = html;
+        }
+        
+        function clearAll() {
+            let cleared = 0;
+            
+            // Clear sessionStorage
+            Object.keys(sessionStorage).forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.') || key.includes('__KC')) {
+                    sessionStorage.removeItem(key);
+                    cleared++;
+                }
+            });
+            
+            // Clear localStorage
+            Object.keys(localStorage).forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.')) {
+                    localStorage.removeItem(key);
+                    cleared++;
+                }
+            });
+            
+            document.getElementById('result').innerHTML = 
+                `<div class="success">✓ Cleared ${cleared} authentication keys from storage</div>`;
+            displayKeys();
+        }
+        
+        function clearSessionOnly() {
+            let cleared = 0;
+            Object.keys(sessionStorage).forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.') || key.includes('__KC')) {
+                    sessionStorage.removeItem(key);
+                    cleared++;
+                }
+            });
+            
+            document.getElementById('result').innerHTML = 
+                `<div class="success">✓ Cleared ${cleared} keys from sessionStorage</div>`;
+            displayKeys();
+        }
+        
+        function clearLocalOnly() {
+            let cleared = 0;
+            Object.keys(localStorage).forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.')) {
+                    localStorage.removeItem(key);
+                    cleared++;
+                }
+            });
+            
+            document.getElementById('result').innerHTML = 
+                `<div class="success">✓ Cleared ${cleared} keys from localStorage</div>`;
+            displayKeys();
+        }
+        
+        function refreshKeys() {
+            displayKeys();
+            document.getElementById('result').innerHTML = 
+                '<div class="success">✓ Refreshed storage keys</div>';
+        }
+        
+        // Display keys on load
+        window.onload = displayKeys;
+    </script>
+</body>
+</html>

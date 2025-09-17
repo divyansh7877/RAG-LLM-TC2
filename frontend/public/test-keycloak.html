@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Keycloak Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/keycloak-js@23.0.7/dist/keycloak.min.js"></script>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            max-width: 800px; 
+            margin: 50px auto; 
+            padding: 20px;
+        }
+        button { 
+            padding: 10px 20px; 
+            margin: 10px;
+            cursor: pointer;
+        }
+        .status { 
+            padding: 10px; 
+            margin: 10px 0; 
+            border-radius: 5px;
+        }
+        .success { 
+            background-color: #d4edda; 
+            color: #155724;
+        }
+        .error { 
+            background-color: #f8d7da; 
+            color: #721c24;
+        }
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 10px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>Keycloak Direct Test</h1>
+    
+    <div id="status" class="status info">Initializing...</div>
+    
+    <div>
+        <button onclick="initKeycloak()">Initialize Keycloak</button>
+        <button onclick="login()">Login</button>
+        <button onclick="logout()">Logout</button>
+        <button onclick="checkStatus()">Check Status</button>
+        <button onclick="clearStorage()">Clear Storage</button>
+    </div>
+    
+    <h3>Current Status:</h3>
+    <pre id="info">Not initialized</pre>
+    
+    <h3>Console Log:</h3>
+    <pre id="log" style="max-height: 300px; overflow-y: auto;"></pre>
+
+    <script>
+        let keycloak = null;
+        
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+            logEl.innerHTML += `[${timestamp}] ${message}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(message);
+        }
+        
+        function updateStatus(message, type = 'info') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+        
+        function initKeycloak() {
+            log('Starting Keycloak initialization...');
+            
+            // Clear any existing instance
+            keycloak = null;
+            
+            // Clear storage first
+            clearStorage();
+            
+            keycloak = new Keycloak({
+                url: 'http://192.168.1.117:8080/',
+                realm: 'rag_app',
+                clientId: 'fastapi-client'
+            });
+            
+            const initOptions = {
+                onLoad: 'check-sso',
+                checkLoginIframe: false,
+                enableLogging: true,
+                flow: 'standard',
+                responseMode: 'query',
+                redirectUri: window.location.origin + window.location.pathname,
+                silentCheckSsoFallback: false
+            };
+            
+            log('Init options: ' + JSON.stringify(initOptions, null, 2));
+            
+            keycloak.init(initOptions)
+                .then(authenticated => {
+                    log(`Keycloak initialized. Authenticated: ${authenticated}`, 'success');
+                    updateStatus(`Initialized - Authenticated: ${authenticated}`, authenticated ? 'success' : 'info');
+                    updateInfo();
+                    
+                    if (authenticated) {
+                        log('Token: ' + keycloak.token?.substring(0, 50) + '...');
+                        log('Token will expire at: ' + new Date(keycloak.tokenParsed.exp * 1000).toLocaleString());
+                    }
+                })
+                .catch(error => {
+                    log('Keycloak init failed: ' + error, 'error');
+                    updateStatus('Initialization failed: ' + error, 'error');
+                    console.error('Full error:', error);
+                });
+        }
+        
+        function login() {
+            if (!keycloak) {
+                log('Keycloak not initialized', 'error');
+                updateStatus('Please initialize Keycloak first', 'error');
+                return;
+            }
+            
+            log('Starting login...');
+            keycloak.login({
+                redirectUri: window.location.origin + window.location.pathname
+            }).catch(error => {
+                log('Login failed: ' + error, 'error');
+            });
+        }
+        
+        function logout() {
+            if (!keycloak) {
+                log('Keycloak not initialized', 'error');
+                return;
+            }
+            
+            log('Starting logout...');
+            keycloak.logout({
+                redirectUri: window.location.origin + window.location.pathname
+            }).catch(error => {
+                log('Logout failed: ' + error, 'error');
+            });
+        }
+        
+        function checkStatus() {
+            if (!keycloak) {
+                updateStatus('Keycloak not initialized', 'error');
+                return;
+            }
+            
+            updateInfo();
+            log('Status checked');
+        }
+        
+        function updateInfo() {
+            if (!keycloak) {
+                document.getElementById('info').textContent = 'Keycloak not initialized';
+                return;
+            }
+            
+            const info = {
+                authenticated: keycloak.authenticated,
+                username: keycloak.tokenParsed?.preferred_username || 'N/A',
+                email: keycloak.tokenParsed?.email || 'N/A',
+                roles: keycloak.tokenParsed?.realm_access?.roles || [],
+                token_exp: keycloak.tokenParsed?.exp ? new Date(keycloak.tokenParsed.exp * 1000).toLocaleString() : 'N/A',
+                session_state: keycloak.sessionId || 'N/A'
+            };
+            
+            document.getElementById('info').textContent = JSON.stringify(info, null, 2);
+        }
+        
+        function clearStorage() {
+            let count = 0;
+            
+            // Clear sessionStorage
+            const ssKeys = Object.keys(sessionStorage);
+            ssKeys.forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.')) {
+                    sessionStorage.removeItem(key);
+                    count++;
+                }
+            });
+            
+            // Clear localStorage
+            const lsKeys = Object.keys(localStorage);
+            lsKeys.forEach(key => {
+                if (key.startsWith('kc-') || key.startsWith('oidc.')) {
+                    localStorage.removeItem(key);
+                    count++;
+                }
+            });
+            
+            log(`Cleared ${count} storage keys`);
+            updateStatus(`Cleared ${count} storage keys`, 'success');
+        }
+        
+        // Check URL parameters on load
+        window.addEventListener('load', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.has('code')) {
+                log('Auth code detected in URL, auto-initializing...');
+                initKeycloak();
+            } else if (urlParams.has('error')) {
+                log('Error in URL: ' + urlParams.get('error'), 'error');
+                updateStatus('Error: ' + urlParams.get('error'), 'error');
+            }
+        });
+    </script>
+</body>
+</html>
