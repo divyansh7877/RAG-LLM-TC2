@@ -528,6 +528,19 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         try:
             response = query_engine.query(query_text)
         except Exception as openai_error:
+            # Check if it's a table not initialized error (no documents uploaded yet)
+            error_str = str(openai_error)
+            if "Table document_embeddings_v2 is not initialized" in error_str or "TableNotFoundError" in type(openai_error).__name__:
+                logger.error(f"Query {query_id} failed: No documents have been uploaded yet")
+                error_msg = "No documents have been uploaded yet. Please upload some documents first before querying."
+                job_manager.fail_job(job_id, error_msg)
+                return {
+                    "error": error_msg,
+                    "job_id": job_id,
+                    "no_documents": True,
+                    "help": "Upload documents using the /api/upload endpoint before querying"
+                }
+            
             # Handle OpenAI-specific errors using centralized logic
             should_retry, delay = should_retry_error(openai_error)
             

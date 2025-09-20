@@ -182,6 +182,11 @@ class StructuredLogger:
         """Log critical message with context."""
         context = self._get_context()
         self.logger.critical(message, extra=context, exc_info=exc_info, **kwargs)
+    
+    def debug(self, message: str, **kwargs):
+        """Log debug message with context."""
+        context = self._get_context()
+        self.logger.debug(message, extra=context, **kwargs)
 
 
 class ErrorHandler:

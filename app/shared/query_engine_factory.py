@@ -68,19 +68,23 @@ N_THREADS = mp.cpu_count()
 # --------------------------------------------------------------------------- 
 # Prompt enforcing source citations
 # --------------------------------------------------------------------------- 
-# Optimized prompt template for better OpenAI responses
-QA_TEMPLATE = """You are an expert AI assistant that provides accurate, well-structured answers based on provided document context.
+# Enhanced prompt template to enforce multi-document citation
+QA_TEMPLATE = """You are an expert AI assistant that synthesizes information from multiple documents.
 
-INSTRUCTIONS:
-1. Analyze the provided context carefully and provide a comprehensive answer to the question
-2. Structure your response clearly with key points and explanations
-3. ALWAYS cite your sources using the format: (Source: {document_name}, Page: {page_number})
-4. If the context doesn't contain sufficient information, state this clearly and suggest what additional information might be needed
-5. Provide actionable insights when relevant
-6. Keep your response focused and avoid unnecessary repetition
+CRITICAL INSTRUCTIONS:
+1. Analyze ALL provided context chunks carefully - they may come from different documents
+2. When information comes from different documents, you MUST cite EACH source separately
+3. Use inline citations immediately after each fact: (Source: document_name, Page: page_number)
+4. If you use information from multiple documents, include citations from ALL of them
+5. Never combine multiple sources into a single citation - cite each individually
+6. At the end of your response, list "Sources Referenced:" with all unique documents cited
+
+CITATION FORMAT:
+- Single source: (Source: Document.pdf, Page: 3)
+- Multiple sources: fact from doc A (Source: A.pdf, Page: 1) and doc B (Source: B.pdf, Page: 2)
 
 ------------------------
-CONTEXT INFORMATION:
+CONTEXT INFORMATION (from potentially multiple documents):
 {context_str}
 
 ------------------------
@@ -88,7 +92,7 @@ USER QUESTION:
 {query_str}
 
 ------------------------
-EXPERT RESPONSE:
+EXPERT RESPONSE (with citations for ALL sources):
 """
 
 # --------------------------------------------------------------------------- 
@@ -186,6 +190,14 @@ class QueryEngineFactory:
                         try:
                             from .lancedb_client import get_db_connection
                             db = get_db_connection()
+                            # Check if table exists
+                            try:
+                                existing_tables = db.table_names()
+                                if preferred_table not in existing_tables:
+                                    self.logger.warning(f"[QE] Table '{preferred_table}' does not exist yet. It will be created when documents are uploaded.")
+                                    # Let it continue - LanceDB will handle the error appropriately
+                            except Exception as e:
+                                self.logger.debug(f"Could not check table existence: {e}")
                             self._vector_store = LanceDBVectorStore(db=db, table_name=preferred_table)  # type: ignore[arg-type]
                             self.logger.info(f"[QE] Step 3: Vector store opened via shared connection (took {(time.perf_counter()-t0):.2f}s)")
                         except TypeError:
@@ -197,8 +209,37 @@ class QueryEngineFactory:
                             )
                             self.logger.info(f"[QE] Step 3: Vector store opened via URI (took {(time.perf_counter()-t0):.2f}s)")
                     except Exception as primary_err:
-                        fallback_table = "document_embeddings"
-                        if preferred_table != fallback_table:
+                        # Check if it's because the table doesn't exist
+                        if "does not exist" in str(primary_err) or "not found" in str(primary_err).lower():
+                            # Try the fallback table
+                            fallback_table = "document_embeddings"
+                            self.logger.warning(
+                                f"Table '{preferred_table}' not found. Trying fallback table '{fallback_table}'."
+                            )
+                            t1 = time.perf_counter()
+                            try:
+                                from .lancedb_client import get_db_connection
+                                db = get_db_connection()
+                                # Check if fallback table exists
+                                existing_tables = db.table_names()
+                                if fallback_table in existing_tables:
+                                    self.logger.info(f"Found fallback table '{fallback_table}' with existing documents")
+                                    self._vector_store = LanceDBVectorStore(db=db, table_name=fallback_table)  # type: ignore[arg-type]
+                                    self.logger.info(f"[QE] Step 3: Fallback vector store opened via shared connection (took {(time.perf_counter()-t1):.2f}s)")
+                                else:
+                                    # No tables exist at all
+                                    raise ValueError(f"No document tables found. Please upload documents first.")
+                            except (TypeError, ValueError) as e:
+                                if "No document tables found" in str(e):
+                                    raise  # Re-raise the no tables error
+                                # Try URI approach
+                                self._vector_store = LanceDBVectorStore(
+                                    uri=DB_PATH, table_name=fallback_table, mode="r"
+                                )
+                                self.logger.info(f"[QE] Step 3: Fallback vector store opened via URI (took {(time.perf_counter()-t1):.2f}s)")
+                        elif preferred_table != "document_embeddings":
+                            # Try the fallback anyway for other errors
+                            fallback_table = "document_embeddings"
                             self.logger.warning(
                                 f"Failed to open table '{preferred_table}': {primary_err}. Trying fallback table '{fallback_table}'."
                             )
