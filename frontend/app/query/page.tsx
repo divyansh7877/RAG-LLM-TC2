@@ -32,7 +32,6 @@ interface QueryResult {
 
 export default function QueryPage() {
   const [query, setQuery] = useState('')
-  const [selectedDataset, setSelectedDataset] = useState('default')
   const [topK, setTopK] = useState(5)
   const [results, setResults] = useState<QueryResult[]>([])
   const [queryTime, setQueryTime] = useState<number | null>(null)
@@ -41,16 +40,10 @@ export default function QueryPage() {
   const api = useApi()
   const queryInputRef = useRef<HTMLTextAreaElement>(null)
 
-  // Fetch available datasets
-  const { data: datasets } = useQuery({
-    queryKey: ['datasets'],
-    queryFn: () => api.getDatasets(),
-  })
-
   // Query mutation
   const queryMutation = useMutation({
-    mutationFn: async ({ query, dataset, top_k }: { query: string; dataset: string; top_k: number }) => {
-      return api.submitQuery({ query, dataset, top_k })
+    mutationFn: async ({ query, top_k }: { query: string; top_k: number }) => {
+      return api.submitQuery({ query, dataset: 'all', top_k })
     },
     onSuccess: (data) => {
       setResults(data.results || [])
@@ -84,7 +77,6 @@ export default function QueryPage() {
     
     queryMutation.mutate({
       query: query.trim(),
-      dataset: selectedDataset,
       top_k: topK,
     })
   }
@@ -131,22 +123,10 @@ export default function QueryPage() {
             <div className="lg:col-span-1">
               <div className="bg-white rounded-lg border border-gray-200 p-6 sticky top-8">
                 <form onSubmit={handleSubmit} className="space-y-6">
-                  <div>
-                    <label htmlFor="dataset" className="block text-sm font-medium text-gray-700 mb-2">
-                      Dataset
-                    </label>
-                    <select
-                      id="dataset"
-                      value={selectedDataset}
-                      onChange={(e) => setSelectedDataset(e.target.value)}
-                      className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-primary focus:border-primary"
-                    >
-                      {datasets?.datasets.map((dataset) => (
-                        <option key={dataset} value={dataset}>
-                          {dataset}
-                        </option>
-                      ))}
-                    </select>
+                  <div className="bg-blue-50 border border-blue-200 rounded-md p-3 mb-4">
+                    <p className="text-sm text-blue-800">
+                      <strong>Note:</strong> Queries search across all your groups and personal documents.
+                    </p>
                   </div>
 
                   <div>

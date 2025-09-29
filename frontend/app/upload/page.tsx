@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { 
@@ -21,6 +21,7 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { formatBytes, getFileIcon, cn } from '@/lib/utils'
 import { useApi } from '@/lib/authenticated-api'
+import { useAuth } from '@/lib/auth'
 import { AuthenticatedLayout } from '@/components/AuthenticatedLayout'
 
 type TabType = 'file' | 'url' | 'text'
@@ -37,17 +38,33 @@ export default function UploadPage() {
   const [dragActive, setDragActive] = useState(false)
   const [urlInput, setUrlInput] = useState('')
   const [textInput, setTextInput] = useState('')
-  const [selectedDataset, setSelectedDataset] = useState('default')
+  const [selectedDataset, setSelectedDataset] = useState('')
   
   const fileInputRef = useRef<HTMLInputElement>(null)
   const queryClient = useQueryClient()
   const api = useApi()
+  const { user } = useAuth()
+  
+  // Helper to format dataset label (Personal vs group name)
+  const getDatasetLabel = (dataset: string) => {
+    if (user && dataset === user.id) {
+      return 'Personal'
+    }
+    return dataset
+  }
 
-  // Fetch available datasets
+  // Fetch available datasets (user's groups)
   const { data: datasets } = useQuery({
     queryKey: ['datasets'],
     queryFn: () => api.getDatasets(),
   })
+  
+  // Set first dataset as default when loaded
+  useEffect(() => {
+    if (datasets?.datasets && datasets.datasets.length > 0 && !selectedDataset) {
+      setSelectedDataset(datasets.datasets[0])
+    }
+  }, [datasets, selectedDataset])
 
   // Upload mutation
   const uploadMutation = useMutation({
@@ -246,7 +263,7 @@ export default function UploadPage() {
           >
             {datasets?.datasets.map((dataset) => (
               <option key={dataset} value={dataset}>
-                {dataset}
+                {getDatasetLabel(dataset)}
               </option>
             ))}
           </select>

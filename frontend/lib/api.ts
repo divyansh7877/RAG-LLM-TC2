@@ -374,10 +374,30 @@ class ApiClient {
     };
   }
 
-  // Mock datasets for now (your backend doesn't have this endpoint)
+  // Get user groups (used as datasets)
+  private userGroups: string[] = [];
+  private userId: string = '';
+  
+  setUserInfo(userId: string, groups: string[]) {
+    this.userId = userId;
+    this.userGroups = groups || [];
+  }
+  
   async getDatasets(): Promise<{ datasets: string[] }> {
-    // This would map to actual groups or be implemented as a new endpoint
-    return { datasets: ['default', 'common_rules', 'assistance'] };
+    // Return user's groups from Keycloak token
+    // Include personal group (user's subject ID) and all Keycloak groups
+    const datasets = [];
+    
+    // Add personal group first
+    if (this.userId) {
+      datasets.push(this.userId); // Personal group using user's sub
+    }
+    
+    // Add user's Keycloak groups
+    datasets.push(...this.userGroups);
+    
+    // If no groups at all, use 'default' as fallback
+    return { datasets: datasets.length > 0 ? datasets : ['default'] };
   }
 }
 

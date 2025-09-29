@@ -11,8 +11,9 @@ interface AuthenticatedApiProviderProps {
 }
 
 export function AuthenticatedApiProvider({ children }: AuthenticatedApiProviderProps) {
-  const { token, keycloak } = useAuth()
+  const { token, user } = useAuth()
   const lastTokenRef = useRef<string | null>(null)
+  const lastUserRef = useRef<string | null>(null)
 
   useEffect(() => {
     // Only update the API client if the token actually changed
@@ -22,6 +23,15 @@ export function AuthenticatedApiProvider({ children }: AuthenticatedApiProviderP
       api.setAuthToken(token)
     }
   }, [token])
+  
+  useEffect(() => {
+    // Update user info when user changes
+    if (user && lastUserRef.current !== user.id) {
+      console.log('[API] User changed, updating user info in API client')
+      lastUserRef.current = user.id
+      api.setUserInfo(user.id, user.groups || [])
+    }
+  }, [user])
 
   return (
     <AuthenticatedApiContext.Provider value={api}>
