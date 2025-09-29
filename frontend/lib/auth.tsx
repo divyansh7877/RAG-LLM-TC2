@@ -36,10 +36,21 @@ function getKeycloakInstance() {
       }
     }
     
+    // Get Keycloak configuration from environment variables
+    const keycloakUrl = process.env.NEXT_PUBLIC_KEYCLOAK_URL || 'http://192.168.1.117:8080';
+    const keycloakRealm = process.env.NEXT_PUBLIC_KEYCLOAK_REALM || 'rag_app';
+    const keycloakClientId = process.env.NEXT_PUBLIC_KEYCLOAK_CLIENT_ID || 'fastapi-client';
+    
+    console.log('[Auth] Initializing Keycloak with config:', {
+      url: keycloakUrl,
+      realm: keycloakRealm,
+      clientId: keycloakClientId
+    });
+    
     keycloakSingleton = new Keycloak({
-      url: 'http://192.168.1.117:8080/',
-      realm: 'rag_app',
-      clientId: 'fastapi-client'
+      url: keycloakUrl,
+      realm: keycloakRealm,
+      clientId: keycloakClientId
     })
   }
   return keycloakSingleton
