@@ -555,6 +555,9 @@ Required settings (in Client Details):
   const logout = () => {
     console.log('[Auth] Logging out')
     
+    // Get the ID token before clearing state (required by Keycloak)
+    const idToken = keycloak?.idToken
+    
     // Clear authentication state
     setUser(null)
     setIsAuthenticated(false)
@@ -574,12 +577,19 @@ Required settings (in Client Details):
       window.__KEYCLOAK_INSTANCE__ = null
     }
     
-    // Build Keycloak logout URL
+    // Build Keycloak logout URL with id_token_hint
     const keycloakUrl = process.env.NEXT_PUBLIC_KEYCLOAK_URL || 'http://192.168.1.117:8080'
     const realm = process.env.NEXT_PUBLIC_KEYCLOAK_REALM || 'rag_app'
     const redirectUri = encodeURIComponent(window.location.origin + '/')
-    const logoutUrl = `${keycloakUrl}/realms/${realm}/protocol/openid-connect/logout?post_logout_redirect_uri=${redirectUri}`
     
+    let logoutUrl = `${keycloakUrl}/realms/${realm}/protocol/openid-connect/logout?post_logout_redirect_uri=${redirectUri}`
+    
+    // Add id_token_hint if available (required by Keycloak for proper logout)
+    if (idToken) {
+      logoutUrl += `&id_token_hint=${encodeURIComponent(idToken)}`
+    }
+    
+    console.log('[Auth] Redirecting to Keycloak logout')
     // Redirect to Keycloak logout
     window.location.href = logoutUrl
   }
