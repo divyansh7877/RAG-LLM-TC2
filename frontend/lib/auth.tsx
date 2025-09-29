@@ -6,33 +6,50 @@ import Keycloak from 'keycloak-js'
 declare global {
   interface Window {
     __KC_INIT_STARTED__?: boolean
+    __KEYCLOAK_INSTANCE__?: Keycloak | null
   }
 }
 
 let keycloakSingleton: Keycloak | null = null
 
 function getKeycloakInstance() {
+  // Try to get instance from window first (persists across page reloads)
+  if (typeof window !== 'undefined' && window.__KEYCLOAK_INSTANCE__) {
+    console.log('[Auth] Using existing Keycloak instance from window')
+    keycloakSingleton = window.__KEYCLOAK_INSTANCE__
+    return keycloakSingleton
+  }
+  
   if (!keycloakSingleton) {
-    // Clear any stale nonce/state from ALL storage locations
+    // Only clear stale state if we're NOT returning from Keycloak
+    // (Don't clear callback state when we have an auth code in URL)
     if (typeof window !== 'undefined') {
-      try {
-        // Clear from sessionStorage
-        const ssKeys = Object.keys(sessionStorage);
-        ssKeys.forEach(key => {
-          if (key.startsWith('kc-callback-') || key.startsWith('oidc.') || key === '__KC_RETRY_ONCE__') {
-            sessionStorage.removeItem(key);
-          }
-        });
-        
-        // IMPORTANT: Also clear from localStorage as Keycloak might use either
-        const lsKeys = Object.keys(localStorage);
-        lsKeys.forEach(key => {
-          if (key.startsWith('kc-callback-') || key.startsWith('oidc.')) {
-            localStorage.removeItem(key);
-          }
-        });
-      } catch (e) {
-        console.warn('[Auth] Could not clear old storage data:', e);
+      const urlParams = new URLSearchParams(window.location.search);
+      const hasAuthCode = urlParams.has('code') && urlParams.has('state');
+      
+      if (!hasAuthCode) {
+        console.log('[Auth] No auth code - clearing old storage data');
+        try {
+          // Clear from sessionStorage
+          const ssKeys = Object.keys(sessionStorage);
+          ssKeys.forEach(key => {
+            if (key.startsWith('kc-callback-') || key.startsWith('oidc.') || key === '__KC_RETRY_ONCE__') {
+              sessionStorage.removeItem(key);
+            }
+          });
+          
+          // IMPORTANT: Also clear from localStorage as Keycloak might use either
+          const lsKeys = Object.keys(localStorage);
+          lsKeys.forEach(key => {
+            if (key.startsWith('kc-callback-') || key.startsWith('oidc.')) {
+              localStorage.removeItem(key);
+            }
+          });
+        } catch (e) {
+          console.warn('[Auth] Could not clear old storage data:', e);
+        }
+      } else {
+        console.log('[Auth] Auth code present - preserving callback state in storage');
       }
     }
     
@@ -52,6 +69,11 @@ function getKeycloakInstance() {
       realm: keycloakRealm,
       clientId: keycloakClientId
     })
+    
+    // Store in window to persist across page reloads
+    if (typeof window !== 'undefined') {
+      window.__KEYCLOAK_INSTANCE__ = keycloakSingleton
+    }
   }
   return keycloakSingleton
 }
@@ -177,6 +199,127 @@ export function AuthProvider({ children }: AuthProviderProps) {
         console.log('[Auth] Has error in URL:', hasError, 'Type:', errorType)
         observedAuthCodeAtStart = hasAuthCode
         
+        // If we have an auth code, we need to handle this manually due to page reload
+        // The Keycloak instance that initiated login is gone, so we'll exchange the code ourselves
+        if (hasAuthCode && urlState) {
+          console.log('[Auth] Auth code detected - handling OAuth callback manually')
+          
+          try {
+            // Get the callback data from storage
+            const callbackKey = `kc-callback-${urlState}`
+            let callbackData = sessionStorage.getItem(callbackKey) || localStorage.getItem(callbackKey)
+            
+            if (!callbackData) {
+              console.error('[Auth] No callback data found for state:', urlState)
+              // Clean up and trigger fresh login
+              cleanUrlParams()
+              const kc = getKeycloakInstance()
+              setTimeout(() => kc.login({ redirectUri: window.location.origin + '/' }), 0)
+              return
+            }
+            
+            const { nonce, redirectUri } = JSON.parse(callbackData)
+            const code = urlParams.get('code')
+            
+            console.log('[Auth] Exchanging authorization code for tokens')
+            
+            // Exchange code for tokens using fetch
+            const tokenEndpoint = `${process.env.NEXT_PUBLIC_KEYCLOAK_URL || 'http://192.168.1.117:8080'}/realms/${process.env.NEXT_PUBLIC_KEYCLOAK_REALM || 'rag_app'}/protocol/openid-connect/token`
+            
+            const tokenResponse = await fetch(tokenEndpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+              },
+              body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                code: code!,
+                redirect_uri: decodeURIComponent(redirectUri),
+                client_id: process.env.NEXT_PUBLIC_KEYCLOAK_CLIENT_ID || 'fastapi-client',
+              }),
+            })
+            
+            if (!tokenResponse.ok) {
+              throw new Error(`Token exchange failed: ${tokenResponse.status} ${tokenResponse.statusText}`)
+            }
+            
+            const tokens = await tokenResponse.json()
+            console.log('[Auth] Successfully exchanged code for tokens')
+            
+            // Parse the ID token to verify nonce
+            const idTokenParts = tokens.id_token.split('.')
+            const idTokenPayload = JSON.parse(atob(idTokenParts[1]))
+            
+            if (idTokenPayload.nonce !== nonce) {
+              console.error('[Auth] Nonce mismatch! Expected:', nonce, 'Got:', idTokenPayload.nonce)
+              throw new Error('Nonce mismatch')
+            }
+            
+            // Parse access token for user data
+            const accessTokenParts = tokens.access_token.split('.')
+            const accessTokenPayload = JSON.parse(atob(accessTokenParts[1]))
+            
+            // Set up user data
+            const userData: User = {
+              id: accessTokenPayload.sub || '',
+              username: accessTokenPayload.preferred_username,
+              email: accessTokenPayload.email,
+              groups: accessTokenPayload.groups || [],
+              roles: accessTokenPayload.realm_access?.roles || [],
+              preferred_username: accessTokenPayload.preferred_username
+            }
+            
+            // Get Keycloak instance and manually set tokens
+            const keycloakInstance = getKeycloakInstance()
+            keycloakInstance.token = tokens.access_token
+            keycloakInstance.refreshToken = tokens.refresh_token
+            keycloakInstance.idToken = tokens.id_token
+            keycloakInstance.tokenParsed = accessTokenPayload
+            keycloakInstance.authenticated = true
+            
+            setKeycloak(keycloakInstance)
+            setUser(userData)
+            setIsAuthenticated(true)
+            setToken(tokens.access_token)
+            
+            // Clean up
+            cleanUrlParams()
+            sessionStorage.removeItem(callbackKey)
+            localStorage.removeItem(callbackKey)
+            sessionStorage.removeItem('__KC_RETRY_ONCE__')
+            
+            // Setup token refresh
+            if (!(keycloakInstance as any).__EVENTS_WIRED__) {
+              ;(keycloakInstance as any).__EVENTS_WIRED__ = true
+              keycloakInstance.onTokenExpired = () => {
+                console.log('[Auth] Token expired, attempting refresh')
+                keycloakInstance
+                  .updateToken(30)
+                  .then((refreshed) => {
+                    if (refreshed) {
+                      setToken(keycloakInstance.token || null)
+                    }
+                  })
+                  .catch((error) => {
+                    console.error('[Auth] Token refresh failed:', error)
+                    keycloakInstance.logout()
+                  })
+              }
+            }
+            
+            console.log('[Auth] Manual authentication complete')
+            setIsLoading(false)
+            setInitialized(true)
+            setInitializingRef(false)
+            return
+            
+          } catch (error) {
+            console.error('[Auth] Manual token exchange failed:', error)
+            // Fall through to normal init flow which will trigger fresh login
+            cleanUrlParams()
+          }
+        }
+        
         // If we have a login_required error, clean it up before init
         if (hasError && errorType === 'login_required') {
           console.log('[Auth] Cleaning login_required error from URL')
@@ -230,24 +373,25 @@ export function AuthProvider({ children }: AuthProviderProps) {
         // Init configuration with fixes for cookie and storage issues
         const usePkce = process.env.NEXT_PUBLIC_KEYCLOAK_USE_PKCE === 'true'
         
-        // Use 'login-required' instead of 'check-sso' to avoid cookie issues
-        // This will redirect to login immediately if not authenticated
-        const onLoadAction = hasAuthCode ? 'check-sso' : 'check-sso'
+        // When we have an auth code (returning from Keycloak), don't specify onLoad
+        // to let Keycloak complete the authentication flow
+        // Otherwise, use 'login-required' to force redirect to login page
+        const onLoadAction = hasAuthCode ? undefined : 'login-required'
         
         const initConfig: any = {
-          onLoad: onLoadAction,
-          checkLoginIframe: false, // Disable iframe completely
+          checkLoginIframe: false, // Disable iframe completely (doesn't work with 3rd party cookies blocked)
           enableLogging: true, // Enable keycloak logging
           flow: 'standard', // Authorization code flow
           responseMode, // Use query by default
-          silentCheckSsoFallback: false, // Don't fallback when SSO check fails
-          silentCheckSsoRedirectUri: window.location.origin + '/',
+          // Remove silent SSO settings as they don't work with blocked cookies
           redirectUri: window.location.origin + '/',
           // Add message and time skew tolerance
           messageReceiveTimeout: 10000,
-          timeSkew: 5,
-          // Use default adapter
-          adapter: 'default'
+          timeSkew: 5
+        }
+        // Only set onLoad if we have a value (when no auth code present)
+        if (onLoadAction) {
+          initConfig.onLoad = onLoadAction
         }
         if (usePkce) {
           initConfig.pkceMethod = 'S256'
@@ -409,9 +553,35 @@ Required settings (in Client Details):
   }
 
   const logout = () => {
-    if (!keycloak) return
-    const redirectUri = window.location.origin + '/'
-    keycloak.logout({ redirectUri })
+    console.log('[Auth] Logging out')
+    
+    // Clear authentication state
+    setUser(null)
+    setIsAuthenticated(false)
+    setToken(null)
+    
+    // Clear all storage
+    try {
+      sessionStorage.clear()
+      localStorage.clear()
+    } catch (e) {
+      console.warn('[Auth] Could not clear storage:', e)
+    }
+    
+    // Clear window globals
+    if (typeof window !== 'undefined') {
+      window.__KC_INIT_STARTED__ = false
+      window.__KEYCLOAK_INSTANCE__ = null
+    }
+    
+    // Build Keycloak logout URL
+    const keycloakUrl = process.env.NEXT_PUBLIC_KEYCLOAK_URL || 'http://192.168.1.117:8080'
+    const realm = process.env.NEXT_PUBLIC_KEYCLOAK_REALM || 'rag_app'
+    const redirectUri = encodeURIComponent(window.location.origin + '/')
+    const logoutUrl = `${keycloakUrl}/realms/${realm}/protocol/openid-connect/logout?post_logout_redirect_uri=${redirectUri}`
+    
+    // Redirect to Keycloak logout
+    window.location.href = logoutUrl
   }
 
   const value: AuthContextType = {
