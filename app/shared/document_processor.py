@@ -40,7 +40,7 @@ class EmbeddingResult:
 class DocumentProcessor:
     """A service to process and embed documents into a vector store."""
     
-    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings_v2", embed_model_name: str = "./models/gte-large-en-v1.5", device: Optional[str] = None):
+    def __init__(self, db_path: str = "./multi_user_db.lance", table_name: str = "document_embeddings", embed_model_name: str = "./models/gte-large-en-v1.5", device: Optional[str] = None):
         self.logger = StructuredLogger(__name__)
         self.db_path = db_path
         self.table_name = table_name

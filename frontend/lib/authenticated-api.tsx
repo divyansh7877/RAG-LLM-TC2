@@ -11,9 +11,19 @@ interface AuthenticatedApiProviderProps {
 }
 
 export function AuthenticatedApiProvider({ children }: AuthenticatedApiProviderProps) {
-  const { token, user } = useAuth()
+  const { token, user, keycloak } = useAuth()
   const lastTokenRef = useRef<string | null>(null)
   const lastUserRef = useRef<string | null>(null)
+  const keycloakSetRef = useRef<boolean>(false)
+
+  useEffect(() => {
+    // Set Keycloak instance once when available
+    if (keycloak && !keycloakSetRef.current) {
+      console.log('[API] Setting Keycloak instance in API client')
+      api.setKeycloakInstance(keycloak)
+      keycloakSetRef.current = true
+    }
+  }, [keycloak])
 
   useEffect(() => {
     // Only update the API client if the token actually changed

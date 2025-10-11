@@ -60,7 +60,7 @@ def process_document_embedding(self, job_id: str, user_id: str, group_id: str, f
         gpu_memory_manager.clear_cache()
         
         # Initialize the processor with configuration from the central config
-        table_name = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
+        table_name = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings")
         device = "cuda" if config.HAS_CUDA else "cpu"
         logger.info(
             f"Preparing DocumentProcessor with db_path={os.path.abspath(config.LANCEDB_PATH)}, "

@@ -89,6 +89,19 @@ class ApiClient {
   }
 
   private async performRequest<T>(url: string, options: RequestInit): Promise<T> {
+    // Refresh token if we have a Keycloak instance available
+    if (this.keycloakInstance) {
+      try {
+        // Try to refresh token (30 seconds validity minimum)
+        await this.keycloakInstance.updateToken(30);
+        // Update our stored token after refresh
+        this.authToken = this.keycloakInstance.token || null;
+      } catch (error) {
+        console.warn('[API] Token refresh failed, continuing with existing token:', error);
+        // Continue with existing token - might still be valid
+      }
+    }
+
     // Add default headers
     const headers: HeadersInit = {
       ...this.defaultHeaders,
@@ -164,9 +177,14 @@ class ApiClient {
   }
 
   private authToken: string | null = null;
+  private keycloakInstance: any = null;
 
   setAuthToken(token: string | null) {
     this.authToken = token;
+  }
+
+  setKeycloakInstance(keycloak: any) {
+    this.keycloakInstance = keycloak;
   }
 
   // Document endpoints
@@ -212,25 +230,61 @@ class ApiClient {
     files.forEach(file => formData.append('files', file));
     formData.append('group_id', groupId);
 
-    const response = await this.request<{
-      job_id: string;
-      message: string;
-      status: string;
-    }>('/api/documents/upload', {
+    // Refresh token if we have a Keycloak instance available
+    if (this.keycloakInstance) {
+      try {
+        await this.keycloakInstance.updateToken(30);
+        this.authToken = this.keycloakInstance.token || null;
+      } catch (error) {
+        console.warn('[API] Token refresh failed for upload:', error);
+      }
+    }
+
+    // Get auth token
+    const token = this.getAuthToken();
+    
+    // Create headers without Content-Type (let browser set it with boundary for multipart)
+    const headers: HeadersInit = {};
+    if (token) {
+      (headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
+    }
+
+    // Make direct fetch call to avoid adding Content-Type header
+    const url = `${this.baseUrl}/api/documents/upload`;
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        // Remove Content-Type to let browser set it with boundary
-        ...Object.fromEntries(
-          Object.entries(this.defaultHeaders).filter(([key]) => key !== 'Content-Type')
-        ),
-      },
+      headers,
       body: formData,
     });
 
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+      
+      try {
+        const errorJson = JSON.parse(errorText);
+        if (errorJson.error?.message) {
+          errorMessage = errorJson.error.message;
+        } else if (errorJson.detail) {
+          errorMessage = errorJson.detail;
+        }
+      } catch {
+        // Use default error message
+      }
+      
+      throw new Error(errorMessage);
+    }
+
+    const result = await response.json() as {
+      job_id: string;
+      message: string;
+      status: string;
+    };
+
     return {
-      task_id: response.job_id,
-      status: response.status,
-      job_id: response.job_id,
+      task_id: result.job_id,
+      status: result.status,
+      job_id: result.job_id,
     };
   }
 
@@ -320,6 +374,7 @@ class ApiClient {
       doc_id?: string;
     }>;
     took_ms: number;
+    answer?: string;
   }> {
     // Map to your backend's query endpoint structure
     const response = await this.request<{
@@ -334,18 +389,63 @@ class ApiClient {
       }),
     });
 
-    // Poll for results - simplified for now
-    const queryResult = await this.getQuery(response.query_id);
+    // Poll for results with retry logic
+    const queryResult = await this.pollForQueryResult(response.query_id, response.job_id);
+    
+    // Transform sources to results format
+    const results = (queryResult.sources || []).map((source: any, index: number) => {
+      // Handle both string sources and object sources
+      if (typeof source === 'string') {
+        return {
+          id: `result_${index}`,
+          score: 0.8,
+          text: source,
+          source: source,
+        };
+      } else {
+        // Source is an object with document_name, page_number, etc.
+        return {
+          id: `result_${index}`,
+          score: source.score || 0.8,
+          text: source.content_snippet || source.text || '',
+          source: source.document_name || source.source || 'Unknown',
+          doc_id: source.doc_id,
+        };
+      }
+    });
     
     return {
-      results: queryResult.sources?.map((source, index) => ({
-        id: `result_${index}`,
-        score: 0.8,
-        text: source,
-        source: source,
-      })) || [],
+      results,
       took_ms: (queryResult.processing_time || 0) * 1000,
+      answer: queryResult.answer, // Include the answer from the backend
     };
+  }
+
+  async pollForQueryResult(queryId: string, jobId: string, maxAttempts: number = 60): Promise<QueryResult> {
+    // Poll every second for up to 60 seconds
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      try {
+        const result = await this.getQuery(queryId);
+        
+        // Check if query is complete
+        if (result.status === 'completed') {
+          return result;
+        } else if (result.status === 'failed') {
+          throw new Error('Query processing failed');
+        }
+        // Continue polling if status is 'pending' or 'processing'
+      } catch (error) {
+        // If we get a 404, the query might not be ready yet, continue polling
+        if (attempt < maxAttempts - 1) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    
+    throw new Error('Query processing timeout');
   }
 
   async getQuery(queryId: string): Promise<QueryResult> {

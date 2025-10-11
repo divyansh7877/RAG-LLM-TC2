@@ -42,7 +42,7 @@ from .openai_config import get_openai_params, get_retrieval_config
 # Configuration
 # --------------------------------------------------------------------------- 
 DB_PATH = getattr(config, "LANCEDB_PATH", "./multi_user_db.lance")
-TABLE_NAME = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings_v2")
+TABLE_NAME = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings")
 EMBED_MODEL_NAME = getattr(config, "EMBEDDING_MODEL_PATH", "./models/gte-large-en-v1.5")
 has_cuda = getattr(config, "HAS_CUDA")
 

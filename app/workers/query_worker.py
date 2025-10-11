@@ -511,6 +511,22 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
             group_ids=group_ids,
         )
         
+        # Verify documents exist in the vector store
+        try:
+            from ..shared.lancedb_client import get_db_connection
+            db = get_db_connection()
+            table_name = os.getenv("LANCEDB_TABLE_NAME", "document_embeddings")
+            if table_name in db.table_names():
+                table = db.open_table(table_name)
+                doc_count = len(table.to_pandas())
+                logger.info(f"Vector store contains {doc_count} total document chunks in table '{table_name}'")
+                if doc_count == 0:
+                    logger.warning(f"Table '{table_name}' exists but is empty!")
+            else:
+                logger.warning(f"Table '{table_name}' does not exist in database")
+        except Exception as check_error:
+            logger.warning(f"Could not verify document count: {check_error}")
+        
         # Process query with OpenAI rate limiting and quota checking
         update_query_progress(query_id, 0.6, "Checking OpenAI availability...")
         
@@ -520,20 +536,27 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
         if not quota_available:
             error_msg = "OpenAI quota exceeded. Please try again later or contact administrator."
             logger.error(f"OpenAI quota exceeded for query {query_id}")
-            job_manager.fail_job(job_id, error_msg)
+            job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_msg)
             return {"error": error_msg, "job_id": job_id, "quota_exceeded": True}
         
         update_query_progress(query_id, 0.7, "Processing query with OpenAI...")
         
         try:
             response = query_engine.query(query_text)
+            
+            # Log retrieval results for debugging
+            if hasattr(response, 'source_nodes'):
+                retrieved_count = len(response.source_nodes)
+                logger.info(f"Query {query_id} retrieved {retrieved_count} document chunks")
+            else:
+                logger.warning(f"Query {query_id} response has no source_nodes attribute")
         except Exception as openai_error:
             # Check if it's a table not initialized error (no documents uploaded yet)
             error_str = str(openai_error)
-            if "Table document_embeddings_v2 is not initialized" in error_str or "TableNotFoundError" in type(openai_error).__name__:
+            if "Table document_embeddings is not initialized" in error_str or "TableNotFoundError" in type(openai_error).__name__:
                 logger.error(f"Query {query_id} failed: No documents have been uploaded yet")
                 error_msg = "No documents have been uploaded yet. Please upload some documents first before querying."
-                job_manager.fail_job(job_id, error_msg)
+                job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_msg)
                 return {
                     "error": error_msg,
                     "job_id": job_id,
@@ -573,7 +596,7 @@ def process_user_query(self, query_id: str, user_id: str, group_ids: List[str], 
                 # Update job with specific error information
                 if "insufficient_quota" in str(openai_error).lower():
                     error_msg = "OpenAI quota exceeded. Please check billing and try again later."
-                    job_manager.fail_job(job_id, error_msg)
+                    job_manager.update_job_status(job_id, JobStatus.FAILED, error=error_msg)
                     return {"error": error_msg, "job_id": job_id, "quota_exceeded": True}
                 raise
         

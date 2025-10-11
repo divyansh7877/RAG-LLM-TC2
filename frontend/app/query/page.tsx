@@ -48,9 +48,11 @@ export default function QueryPage() {
     onSuccess: (data) => {
       setResults(data.results || [])
       setQueryTime(data.took_ms)
-      // For now, generate a simple answer from the results
-      if (data.results?.length > 0) {
-        setAnswer(`Based on ${data.results.length} documents, here are the most relevant findings.`)
+      // Use the actual answer from the backend
+      if (data.answer) {
+        setAnswer(data.answer)
+      } else if (data.results?.length > 0) {
+        setAnswer(`Found ${data.results.length} relevant documents.`)
       } else {
         setAnswer('No relevant documents found for your query.')
       }
